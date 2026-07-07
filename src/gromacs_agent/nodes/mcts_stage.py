@@ -6,9 +6,6 @@ from gromacs_agent.nodes.executor import execute_node
 
 
 def mcts_stage_node(state: AgentState) -> dict:
-    """
-    MCTSを使って現在のステージ (em, nvt等) の最適パラメータを探索するノード。
-    """
     stage = state["current_step"]
     base_config = state["current_config"]
     kb = KnowledgeBase()
@@ -32,7 +29,6 @@ def mcts_stage_node(state: AgentState) -> dict:
 
     success = result["success"]
 
-    # テストが期待するフォーマットで history エントリを作成
     mcts_entry = {
         "type": "mcts",
         "stage": stage,
@@ -43,7 +39,6 @@ def mcts_stage_node(state: AgentState) -> dict:
     }
 
     return {
-        # ★ テストは "STAGE_FAILED" を期待している
         "status": "SUCCESS" if success else "STAGE_FAILED",
         "current_config": result["config"],
         "last_error": result["log"] if not success else None,
