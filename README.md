@@ -1,8 +1,3 @@
-以下に、自律型GROMACS MDシミュレーションAIエージェント **GromacsMaster** のREADME.mdを作成しました。
-GitHubリポジトリのルートに配置することを想定しています。
-
----
-
 # 🧬 GromacsMaster: Autonomous AI Agent for MD Simulations
 
 **GromacsMaster** は、計算化学研究のための自律型AIエージェントです。
