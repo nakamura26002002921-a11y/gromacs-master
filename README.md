@@ -44,6 +44,22 @@ SQLite + FTS5を用いた軽量かつ高速なRAG（Retrieval-Augmented Generati
 すべてのLLM推論、実行コマンド、修正履歴をJSON形式で記録。
 「なぜこのパラメータに変更したのか」の根拠を後から追跡可能です。
 
+### 5. EM/NVT単位のモンテカルロ木探索 (MCTS)
+GROMACSの1回の実行は数分〜数時間かかるため、単純な「1つの修正を試して失敗したら次」という
+逐次リトライでは非効率です。GromacsMasterは `em` や `nvt` のような**「切りの良い単位」**でMCTSを
+導入し、複数のパラメータ候補を木構造で管理しながら、UCB1アルゴリズムで有望な候補から優先的に
+実行します。
+
+*   **ノード** = あるステージにおける1つのパラメータ候補
+*   **選択(Selection)** = KnowledgeBaseのsuccess_rateを事前分布(prior)としたUCB1
+*   **プレイアウト** = 実際のgrompp/mdrun実行 (コストが高いため、ここが唯一の「本物の試行」)
+*   **打ち切り条件** = いずれかの候補が成功した時点でそのステージは完了とみなし、次のステージへ
+
+これにより、探索コスト(実行回数)を抑えつつ、単一の仮説に固執しない頑健な自動修正が可能になります。
+MCTS対象ステージは `configs/default_config.yaml` の `mcts.stages` で変更できます
+(デフォルト: `["em", "nvt"]`)。MCTS対象外のステージ (`pdb2gmx`, `editconf` など) は、
+従来通りシンプルな単発実行 + Diagnoser/Replannerの1本道リトライで処理されます。
+
 ---
 
 ## 🏗️ アーキテクチャ
@@ -51,19 +67,24 @@ SQLite + FTS5を用いた軽量かつ高速なRAG（Retrieval-Augmented Generati
 ```mermaid
 graph TD
     User[User Request] --> Planner
-    Planner --> Executor
-    Executor --> Observer
-    Observer -->|Success| NextStep[Next Step / End]
-    Observer -->|Failure| Diagnoser
-    Diagnoser -->|RAG + LLM| Replanner
+    Planner --> Router{Stage Type?}
+    Router -->|em / nvt 等| MCTS[MCTS Stage Search]
+    Router -->|その他| Executor
+    Executor -->|Success| Advance
+    Executor -->|Failure| Diagnoser
+    Diagnoser -->|RAG + LLM/KB| Replanner
     Replanner -->|Modify Config| Executor
-    Replanner -->|Max Attempts| End[Fail]
-    
+    Replanner -->|Max Attempts| StageFailed[Fail]
+    MCTS -->|いずれかの候補が成功| Advance
+    MCTS -->|Budget枯渇| StageFailed
+    Advance -->|次のステージあり| Router
+    Advance -->|全ステージ完了| Done[ALL_DONE]
+
     subgraph "Knowledge Base"
-        DB[(SQLite + FTS5)]
+        DB[(SQLite + FTS5, success/fail count)]
     end
     Diagnoser -.->|Search| DB
-    Reflection -.->|Update| DB
+    MCTS -.->|Search / Record Result| DB
 ```
 
 ---
@@ -80,7 +101,7 @@ graph TD
 リポジトリのクローンと依存パッケージのインストール（`uv` 推奨）:
 
 ```bash
-git clone https://github.com/your-repo/gromacs-master.git
+git clone https://github.com/nakamura26002002921-a11y/gromacs-master.git
 cd gromacs-master
 
 # uvを使った環境構築
@@ -107,50 +128,51 @@ ANTHROPIC_API_KEY=sk-ant-...
 `configs/default_config.yaml` を編集し、シミュレーション条件を設定します。
 
 ```yaml
+agent:
+  max_attempts: 3
+  llm_provider: "openai"   # openai or anthropic (未設定ならKnowledgeBaseのみで診断)
+  model_name: "gpt-4o"
+
+mcts:
+  stages: ["em", "nvt"]        # MCTSで探索するステージ
+  max_iterations: 4            # 1ステージあたりの最大実行回数
+  max_candidates: 3            # 1回の展開で生成する候補数
+  exploration_constant: 1.41   # UCB1の探索定数 (sqrt(2))
+  max_depth: 3                 # 連鎖的な修正探索の最大深さ
+
 gromacs:
   force_field: "amber99sb-ildn"
   water_model: "tip3p"
-
-simulation:
-  em: { nsteps: 5000, emtol: 1000.0 }
-  nvt: { temperature: 300, dt: 0.002 }
-  npt: { pressure: 1.0, dt: 0.002 }
-
-agent:
-  max_attempts: 3
-  llm_model: "gpt-4o"
 ```
 
 ### 2. 実行
 対象のPDBファイルを配置し、エージェントを起動します。
 
 ```bash
-python main.py --input protein.pdb --config configs/default_config.yaml
+python main.py
 ```
 
 ### 3. 結果の確認
-実行ログは `data/logs/` にJSON形式で保存されます。
-また、標準出力にリアルタイムでステータスが表示されます。
+実行ごとの探索木・修正履歴は `AgentState.history` にJSON形式で蓄積され、
+標準出力にも最終ステータスとConfigが表示されます。
 
 ---
 
 ## 📂 ディレクトリ構成
 
 ```text
-gromacs_agent/
-├── configs/             # YAML設定ファイル
+gromacs-master/
+├── configs/
+│   └── default_config.yaml   # agent / mcts / gromacs設定
 ├── src/gromacs_agent/
-│   ├── core/            # State, Graph定義 (LangGraph)
-│   ├── planner/         # ワークフロー計画
-│   ├── executor/        # GROMACS実行ラッパー
-│   ├── observer/        # ログ解析
-│   ├── diagnoser/       # エラー診断 (LLM + RAG)
-│   ├── replanner/       # 修正計画
-│   ├── reflection/      # 経験学習
-│   ├── knowledge/       # SQLite DB管理
-│   └── tools/           # GROMACSコマンドツール
-├── tests/               # pytestテスト
-└── data/                # 実行ログ、DB
+│   ├── core/                 # State, Graph定義 (LangGraph), Pydantic Config
+│   ├── nodes/                # planner / executor / diagnoser / replanner / mcts_stage
+│   ├── mcts/                 # MCTSNode, MCTSStageSearch, 候補生成ロジック
+│   ├── knowledge/            # SQLite + FTS5 ナレッジベース (success/fail count付き)
+│   ├── tools/                # GROMACSコマンド実行ラッパー
+│   └── utils/                # ロガー設定 等
+├── tests/                    # pytestテスト (agent全体 / MCTSエンジン単体)
+└── main.py                   # エントリポイント
 ```
 
 ---
