@@ -16,13 +16,11 @@ def mock_knowledge_base(tmp_path):
 class TestDiagnoserWithLLM:
     """LLMを使用した診断のテスト"""
 
+    @patch("gromacs_agent.nodes.diagnoser.ChatPromptTemplate")
     @patch("gromacs_agent.nodes.diagnoser.ChatOpenAI")
-    def test_diagnoser_with_llm_success(self, mock_chat_openai, mock_knowledge_base, monkeypatch):
+    def test_diagnoser_with_llm_success(self, mock_chat_openai, mock_prompt_template, mock_knowledge_base, monkeypatch):
         """LLMが正常に診断結果を返すケース"""
-        # 環境変数をセット
         monkeypatch.setenv("OPENAI_API_KEY", "test_key")
-        
-        # KnowledgeBaseをモック化
         monkeypatch.setattr(
             "gromacs_agent.nodes.diagnoser.KnowledgeBase",
             lambda: mock_knowledge_base
@@ -36,21 +34,27 @@ class TestDiagnoserWithLLM:
             "parameters": {"dt": 0.001, "emtol": 500.0}
         })
         
+        # チェーン（prompt | llm）のモック
+        mock_chain = MagicMock()
+        mock_chain.invoke.return_value = mock_response
+        
+        # ChatPromptTemplate.from_template().invoke() が呼ばれるので、
+        # from_template の戻り値をモックし、その __or__ メソッドでモックチェーンを返す
+        mock_prompt = MagicMock()
+        mock_prompt.__or__.return_value = mock_chain
+        mock_prompt_template.from_template.return_value = mock_prompt
+        
         mock_llm_instance = MagicMock()
-        mock_llm_instance.invoke.return_value = mock_response
         mock_chat_openai.return_value = mock_llm_instance
         
-        # テスト用の状態
         state = {
             "status": "FAILED",
             "last_error": "LINCS warning: too many warnings",
             "current_config": {"dt": 0.002, "nsteps": 50000},
         }
         
-        # 実行
         result = diagnose_node(state)
         
-        # 検証
         assert result["status"] == "NEEDS_REPLAN"
         assert "diagnosis_context" in result
         assert result["diagnosis_context"]["cause"] == "LINCS warning due to large time step"
@@ -58,12 +62,12 @@ class TestDiagnoserWithLLM:
         assert result["diagnosis_context"]["parameters"]["dt"] == 0.001
         assert result["diagnosis_context"]["parameters"]["emtol"] == 500.0
         
-        # LLMが呼び出されたことを確認
         mock_chat_openai.assert_called_once_with(model="gpt-4o", temperature=0)
-        assert mock_llm_instance.invoke.called
+        assert mock_chain.invoke.called
 
+    @patch("gromacs_agent.nodes.diagnoser.ChatPromptTemplate")
     @patch("gromacs_agent.nodes.diagnoser.ChatOpenAI")
-    def test_diagnoser_with_llm_parse_error(self, mock_chat_openai, mock_knowledge_base, monkeypatch):
+    def test_diagnoser_with_llm_parse_error(self, mock_chat_openai, mock_prompt_template, mock_knowledge_base, monkeypatch):
         """LLMが不正なJSONを返すケース（フォールバック処理が動作することを確認）"""
         monkeypatch.setenv("OPENAI_API_KEY", "test_key")
         monkeypatch.setattr(
@@ -75,8 +79,14 @@ class TestDiagnoserWithLLM:
         mock_response = MagicMock()
         mock_response.content = "This is not valid JSON {{{"
         
+        mock_chain = MagicMock()
+        mock_chain.invoke.return_value = mock_response
+        
+        mock_prompt = MagicMock()
+        mock_prompt.__or__.return_value = mock_chain
+        mock_prompt_template.from_template.return_value = mock_prompt
+        
         mock_llm_instance = MagicMock()
-        mock_llm_instance.invoke.return_value = mock_response
         mock_chat_openai.return_value = mock_llm_instance
         
         state = {
@@ -86,16 +96,15 @@ class TestDiagnoserWithLLM:
         
         result = diagnose_node(state)
         
-        # フォールバック処理が動作することを確認
         assert result["status"] == "NEEDS_REPLAN"
         assert "diagnosis_context" in result
         assert "Parse error" in result["diagnosis_context"]["cause"]
         assert result["diagnosis_context"]["fix_type"] == "PARAMETER_CHANGE"
-        # Segmentation fault の場合は dt が縮小される
         assert "dt" in result["diagnosis_context"]["parameters"]
 
+    @patch("gromacs_agent.nodes.diagnoser.ChatPromptTemplate")
     @patch("gromacs_agent.nodes.diagnoser.ChatOpenAI")
-    def test_diagnoser_with_api_error(self, mock_chat_openai, mock_knowledge_base, monkeypatch):
+    def test_diagnoser_with_api_error(self, mock_chat_openai, mock_prompt_template, mock_knowledge_base, monkeypatch):
         """APIエラーが発生してフォールバックするケース"""
         from openai import AuthenticationError
         
@@ -106,12 +115,18 @@ class TestDiagnoserWithLLM:
         )
         
         # APIエラーを発生させるモック
-        mock_llm_instance = MagicMock()
-        mock_llm_instance.invoke.side_effect = AuthenticationError(
+        mock_chain = MagicMock()
+        mock_chain.invoke.side_effect = AuthenticationError(
             message="Invalid API key",
             response=MagicMock(),
             body={"error": {"message": "Invalid API key"}}
         )
+        
+        mock_prompt = MagicMock()
+        mock_prompt.__or__.return_value = mock_chain
+        mock_prompt_template.from_template.return_value = mock_prompt
+        
+        mock_llm_instance = MagicMock()
         mock_chat_openai.return_value = mock_llm_instance
         
         state = {
@@ -121,17 +136,16 @@ class TestDiagnoserWithLLM:
         
         result = diagnose_node(state)
         
-        # フォールバック処理が動作することを確認
         assert result["status"] == "NEEDS_REPLAN"
         assert "diagnosis_context" in result
         assert "OpenAI error" in result["diagnosis_context"]["cause"]
         assert result["diagnosis_context"]["fix_type"] == "PARAMETER_CHANGE"
-        # Blowing up の場合は emtol と nsteps が調整される
         assert "emtol" in result["diagnosis_context"]["parameters"]
         assert "nsteps" in result["diagnosis_context"]["parameters"]
 
+    @patch("gromacs_agent.nodes.diagnoser.ChatPromptTemplate")
     @patch("gromacs_agent.nodes.diagnoser.ChatOpenAI")
-    def test_diagnoser_with_lincs_warning(self, mock_chat_openai, mock_knowledge_base, monkeypatch):
+    def test_diagnoser_with_lincs_warning(self, mock_chat_openai, mock_prompt_template, mock_knowledge_base, monkeypatch):
         """LINCS警告に対する診断が正しく行われるケース"""
         monkeypatch.setenv("OPENAI_API_KEY", "test_key")
         monkeypatch.setattr(
@@ -146,8 +160,14 @@ class TestDiagnoserWithLLM:
             "parameters": {"dt": 0.0005}
         })
         
+        mock_chain = MagicMock()
+        mock_chain.invoke.return_value = mock_response
+        
+        mock_prompt = MagicMock()
+        mock_prompt.__or__.return_value = mock_chain
+        mock_prompt_template.from_template.return_value = mock_prompt
+        
         mock_llm_instance = MagicMock()
-        mock_llm_instance.invoke.return_value = mock_response
         mock_chat_openai.return_value = mock_llm_instance
         
         state = {
@@ -160,8 +180,9 @@ class TestDiagnoserWithLLM:
         assert result["status"] == "NEEDS_REPLAN"
         assert result["diagnosis_context"]["parameters"]["dt"] == 0.0005
 
+    @patch("gromacs_agent.nodes.diagnoser.ChatPromptTemplate")
     @patch("gromacs_agent.nodes.diagnoser.ChatOpenAI")
-    def test_diagnoser_with_workflow_change_suggestion(self, mock_chat_openai, mock_knowledge_base, monkeypatch):
+    def test_diagnoser_with_workflow_change_suggestion(self, mock_chat_openai, mock_prompt_template, mock_knowledge_base, monkeypatch):
         """LLMがワークフロー変更を提案するケース"""
         monkeypatch.setenv("OPENAI_API_KEY", "test_key")
         monkeypatch.setattr(
@@ -176,8 +197,14 @@ class TestDiagnoserWithLLM:
             "parameters": {"add_position_restraints": True}
         })
         
+        mock_chain = MagicMock()
+        mock_chain.invoke.return_value = mock_response
+        
+        mock_prompt = MagicMock()
+        mock_prompt.__or__.return_value = mock_chain
+        mock_prompt_template.from_template.return_value = mock_prompt
+        
         mock_llm_instance = MagicMock()
-        mock_llm_instance.invoke.return_value = mock_response
         mock_chat_openai.return_value = mock_llm_instance
         
         state = {
@@ -193,7 +220,6 @@ class TestDiagnoserWithLLM:
 
     def test_diagnoser_without_api_key(self, mock_knowledge_base, monkeypatch):
         """APIキーが設定されていない場合のフォールバック処理"""
-        # 環境変数を削除
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.setattr(
             "gromacs_agent.nodes.diagnoser.KnowledgeBase",
@@ -207,12 +233,10 @@ class TestDiagnoserWithLLM:
         
         result = diagnose_node(state)
         
-        # フォールバック処理が動作することを確認
         assert result["status"] == "NEEDS_REPLAN"
         assert "diagnosis_context" in result
         assert "no API key" in result["diagnosis_context"]["cause"]
         assert result["diagnosis_context"]["fix_type"] == "PARAMETER_CHANGE"
-        # LINCS警告の場合は dt が縮小される
         assert result["diagnosis_context"]["parameters"]["dt"] == 0.001
 
     def test_diagnoser_with_success_status(self, mock_knowledge_base, monkeypatch):
@@ -229,6 +253,5 @@ class TestDiagnoserWithLLM:
         
         result = diagnose_node(state)
         
-        # 診断は行われず、SUCCESSが返される
         assert result["status"] == "SUCCESS"
         assert "diagnosis_context" not in result
