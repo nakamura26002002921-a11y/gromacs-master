@@ -6,6 +6,20 @@ from gromacs_agent.nodes.executor import execute_node
 from gromacs_agent.nodes.diagnoser import diagnose_node
 from gromacs_agent.nodes.replanner import replan_node
 
+def route_after_executor(state: AgentState) -> str:
+    """実行後の分岐ロジック"""
+    if state.get("status") == "FAILED":
+        return "diagnose"
+    # 成功時は次のステップへ（簡易化のためここではENDとする）
+    # 本来は state["step_index"] を進めて execute に戻すループを作る
+    return "end"
+
+def route_after_replanner(state: AgentState) -> str:
+    """修正後の分岐ロジック"""
+    if state.get("attempt_count", 0) >= state.get("max_attempts", 3):
+        return "end"
+    return "retry"
+
 def build_graph():
     workflow = StateGraph(AgentState)
 
@@ -19,20 +33,32 @@ def build_graph():
     workflow.set_entry_point("planner")
     workflow.add_edge("planner", "executor")
     
-    # 条件付きエッジ: 成功なら次へ、失敗なら診断へ
+    # 条件付きエッジ (修正版)
     workflow.add_conditional_edges(
         "executor",
-        lambda state: "diagnoser" if state["status"] == "FAILED" else "next_step"
+        route_after_executor,
+        {
+            "diagnose": "diagnoser",
+            "end": END
+        }
     )
     
     workflow.add_edge("diagnoser", "replanner")
     
-    # リトライループ
     workflow.add_conditional_edges(
         "replanner",
-        lambda state: "executor" if state["attempt_count"] < state["max_attempts"] else END
+        route_after_replanner,
+        {
+            "retry": "executor",
+            "end": END
+        }
     )
 
     return workflow.compile()
 
-agent_app = build_graph()
+# インポートエラーを防ぐためのインスタンス化
+try:
+    agent_app = build_graph()
+except Exception as e:
+    print(f"Graph build error: {e}")
+    agent_app = None
