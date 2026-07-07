@@ -9,8 +9,6 @@ from gromacs_agent.core.state import AgentState
 
 
 def _fallback_diagnosis(error_log: str, reason: str) -> dict:
-    """LLMが使えない場合のフォールバック診断結果"""
-    # エラーログから簡易的にパラメータ変更を推測
     params = {}
     log_lower = (error_log or "").lower()
     if "lincs" in log_lower:
@@ -40,7 +38,6 @@ def diagnose_node(state: AgentState) -> dict:
     error_log = state.get("last_error") or ""
     similar_cases = kb.search(error_log)
 
-    # ---- APIキーが無い場合は即フォールバック ----
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         return _fallback_diagnosis(error_log, "no API key")
@@ -65,7 +62,6 @@ def diagnose_node(state: AgentState) -> dict:
         response = chain.invoke({"log": error_log, "cases": json.dumps(similar_cases)})
         diagnosis = json.loads(response.content)
     except OpenAIError as e:
-        # 401 AuthenticationError, RateLimitError, APIConnectionError 等をすべてキャッチ
         return _fallback_diagnosis(error_log, f"OpenAI error: {e}")
     except (json.JSONDecodeError, KeyError, TypeError) as e:
         return _fallback_diagnosis(error_log, f"Parse error: {e}")
