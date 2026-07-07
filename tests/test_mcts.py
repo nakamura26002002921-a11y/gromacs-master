@@ -248,10 +248,29 @@ class TestMCTSStageSearch:
 
         # 複数の設定が試されたことを確認
         assert len(attempted_configs) >= 2
+        
         # 初期設定が含まれていることを確認
-        assert any(c.get("dt") == 0.002 for c in attempted_configs)
-        # ★ 修正: nstepsは保持されるが、emtolは変更される可能性がある
-        for config in attempted_configs:
-            assert config.get("nsteps") == 50000
-            # emtolはMCTSによって変更される可能性があるため、厳密な一致は要求しない
-            assert "emtol" in config
+        assert any(
+            c.get("dt") == 0.002 and c.get("nsteps") == 50000 and c.get("emtol") == 1000.0
+            for c in attempted_configs
+        )
+        
+        # ★ 修正: 少なくとも1つの設定が変更されていることを確認
+        # MCTSはエラーに応じてdt, nsteps, emtolのいずれかを変更する可能性がある
+        initial_config = {"dt": 0.002, "nsteps": 50000, "emtol": 1000.0}
+        modified_configs = [
+            c for c in attempted_configs
+            if c != initial_config
+        ]
+        assert len(modified_configs) >= 1, "MCTS should modify at least one configuration"
+        
+        # 変更されたパラメータが存在することを確認
+        for config in modified_configs:
+            changed_params = []
+            if config.get("dt") != 0.002:
+                changed_params.append("dt")
+            if config.get("nsteps") != 50000:
+                changed_params.append("nsteps")
+            if config.get("emtol") != 1000.0:
+                changed_params.append("emtol")
+            assert len(changed_params) > 0, f"Config should have at least one changed parameter: {config}"
