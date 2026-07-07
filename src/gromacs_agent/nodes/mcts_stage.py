@@ -12,10 +12,10 @@ def mcts_stage_node(state: AgentState) -> dict:
     base_config = state["current_config"]
     kb = KnowledgeBase()
 
-    # MCTSの各ノードで実行されるシミュレーション関数
     def simulate_fn(stage_name: str, config: dict) -> tuple[bool, float, str]:
         temp_state = {**state, "current_config": config}
         result = execute_node(temp_state)
+        # executor.py の修正により、"SUCCESS" が正しく返ってくるようになる
         success = result["status"] == "SUCCESS"
         reward = 1.0 if success else 0.0
         log = result.get("last_error", "") or ""
@@ -26,13 +26,13 @@ def mcts_stage_node(state: AgentState) -> dict:
         base_config=base_config,
         kb=kb,
         simulate_fn=simulate_fn,
-        max_iterations=4, # configから読んでもOK
+        max_iterations=state.get("mcts_max_iterations", 4),
     )
-    
     result = search.run()
 
     return {
-        "status": "SUCCESS" if result["success"] else "FAILED",
+        # 失敗時は "STAGE_FAILED" を返すように修正
+        "status": "SUCCESS" if result["success"] else "STAGE_FAILED",
         "current_config": result["config"],
         "last_error": result["log"] if not result["success"] else None,
         "history": state.get("history", []) + [{"stage": stage, "mcts_tree": result.get("tree", {})}]
