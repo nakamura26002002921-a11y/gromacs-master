@@ -3,9 +3,34 @@ import os
 import json
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
-from openai import AuthenticationError, APIConnectionError, RateLimitError
+from openai import OpenAIError
 from gromacs_agent.knowledge.db import KnowledgeBase
 from gromacs_agent.core.state import AgentState
+
+
+def _fallback_diagnosis(error_log: str, reason: str) -> dict:
+    """LLMが使えない場合のフォールバック診断結果"""
+    # エラーログから簡易的にパラメータ変更を推測
+    params = {}
+    log_lower = (error_log or "").lower()
+    if "lincs" in log_lower:
+        params = {"dt": 0.001}
+    elif "blowing up" in log_lower or "instability" in log_lower:
+        params = {"emtol": 500.0, "nsteps": 100000}
+    elif "segmentation fault" in log_lower:
+        params = {"dt": 0.001}
+    else:
+        params = {"dt": 0.001}
+
+    return {
+        "diagnosis_context": {
+            "cause": f"Fallback diagnosis ({reason})",
+            "fix_type": "PARAMETER_CHANGE",
+            "parameters": params,
+        },
+        "status": "NEEDS_REPLAN",
+    }
+
 
 def diagnose_node(state: AgentState) -> dict:
     if state.get("status") != "FAILED":
@@ -15,17 +40,10 @@ def diagnose_node(state: AgentState) -> dict:
     error_log = state.get("last_error") or ""
     similar_cases = kb.search(error_log)
 
-    # APIキーがない場合のフォールバック
+    # ---- APIキーが無い場合は即フォールバック ----
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        return {
-            "diagnosis_context": {
-                "cause": "Missing API Key (Dummy Diagnosis)",
-                "fix_type": "PARAMETER_CHANGE",
-                "parameters": {"dt": 0.001}
-            },
-            "status": "NEEDS_REPLAN"
-        }
+        return _fallback_diagnosis(error_log, "no API key")
 
     prompt = ChatPromptTemplate.from_template("""
     You are an expert Computational Chemist.
@@ -46,15 +64,13 @@ def diagnose_node(state: AgentState) -> dict:
         chain = prompt | llm
         response = chain.invoke({"log": error_log, "cases": json.dumps(similar_cases)})
         diagnosis = json.loads(response.content)
-    except (AuthenticationError, APIConnectionError, RateLimitError, json.JSONDecodeError) as e:
-        # APIキーが無効な場合や接続エラー、パースエラーの場合はダミーを返す
-        diagnosis = {
-            "cause": f"API Error or Parse Error: {str(e)}",
-            "fix_type": "PARAMETER_CHANGE",
-            "parameters": {"dt": 0.001}
-        }
+    except OpenAIError as e:
+        # 401 AuthenticationError, RateLimitError, APIConnectionError 等をすべてキャッチ
+        return _fallback_diagnosis(error_log, f"OpenAI error: {e}")
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        return _fallback_diagnosis(error_log, f"Parse error: {e}")
 
     return {
         "diagnosis_context": diagnosis,
-        "status": "NEEDS_REPLAN"
+        "status": "NEEDS_REPLAN",
     }
