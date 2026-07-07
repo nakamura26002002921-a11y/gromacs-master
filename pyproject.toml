@@ -1,3 +1,4 @@
+# pyproject.toml
 [project]
 name = "gromacs-agent"
 version = "0.1.0"
@@ -13,8 +14,8 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-where = ["src"] # srcディレクトリ以下をパッケージとして探す
+where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"] # テスト時にsrcをパスに追加
+pythonpath = ["src"]
