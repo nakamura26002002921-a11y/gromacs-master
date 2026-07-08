@@ -1,0 +1,209 @@
+diff --git a/main.py b/main.py
+index 9914076..732e716 100644
+--- a/main.py
++++ b/main.py
+@@ -1,17 +1,56 @@
+ # main.py
+-import asyncio
+-from gromacs_agent.core.graph import agent_app
++"""
++GROMACS Autonomous Agent エントリポイント。
++
++使い方:
++    python main.py                     # デフォルト (1ALC) を実行
++    python main.py --pdb-id 1AKI       # 別のPDB IDを指定
++    python main.py --pdb-file my.pdb   # ローカルのPDBファイルを使う (ダウンロードしない)
++    python main.py --work-dir ./run1   # 作業ディレクトリを固定 (省略時は一時ディレクトリ)
++
++注意: このスクリプトは実際に `gmx` コマンドを呼び出します。GROMACSが
++PATHに通った環境で実行してください (このリポジトリのCIやサンドボックスには
++GROMACS自体は含まれていません)。
++"""
++import argparse
++import os
++import shutil
++import sys
++import tempfile
++import urllib.request
++
++from gromacs_agent.core.graph import build_graph
+ from gromacs_agent.utils.logger import setup_logger
+ 
+-async def main():
+-    setup_logger()
+-    
+-    print("🚀 Starting GROMACS Autonomous Agent...")
+-    
+-    initial_state = {
+-        "system_name": "lysozyme_in_water",
+-        "pdb_file": "1AKI.pdb",
+-        "workflow": [], # Plannerが生成
++RCSB_URL_TEMPLATE = "https://files.rcsb.org/download/{pdb_id}.pdb"
++
++
++def _download_pdb(pdb_id: str, dest_path: str):
++    url = RCSB_URL_TEMPLATE.format(pdb_id=pdb_id.upper())
++    print(f"📥 Downloading {pdb_id} from {url} ...")
++    try:
++        urllib.request.urlretrieve(url, dest_path)
++    except Exception as e:
++        print(f"❌ Failed to download {pdb_id}.pdb: {e}", file=sys.stderr)
++        print("   -f https://files.rcsb.org にネットワークアクセスできるか確認してください。", file=sys.stderr)
++        sys.exit(1)
++
++
++def build_initial_state(pdb_id: str, pdb_file: str, work_dir: str) -> dict:
++    os.makedirs(work_dir, exist_ok=True)
++    input_pdb_path = os.path.join(work_dir, "input.pdb")
++
++    if pdb_file:
++        shutil.copy(pdb_file, input_pdb_path)
++        system_name = os.path.splitext(os.path.basename(pdb_file))[0]
++    else:
++        _download_pdb(pdb_id, input_pdb_path)
++        system_name = pdb_id.upper()
++
++    return {
++        "system_name": system_name,
++        "pdb_file": "input.pdb",  # work_dir内での相対パス (executor.pyのpdb2gmxが参照)
++        "workflow": [],           # Plannerが生成
+         "step_index": 0,
+         "attempt_count": 0,
+         "max_attempts": 3,
+@@ -19,16 +58,45 @@ async def main():
+             "force_field": "amber99sb-ildn",
+             "water": "tip3p",
+             "dt": 0.002,
+-            "nsteps": 50000
++            "nsteps": 50000,
+         },
+-        "history": []
++        "history": [],
++        # em/nvtなど「切りの良い単位」でMCTS探索を行うステージ
++        "mcts_stages": ["em", "nvt"],
++        "mcts_max_iterations": 4,
++        "mcts_max_candidates": 3,
++        "mcts_exploration_constant": 1.41,
++        "work_dir": work_dir,
+     }
+-    
++
++
++def main():
++    parser = argparse.ArgumentParser(description="GROMACS Autonomous Agent")
++    parser.add_argument("--pdb-id", default="1ALC", help="RCSBからダウンロードするPDB ID (デフォルト: 1ALC)")
++    parser.add_argument("--pdb-file", default=None, help="ローカルのPDBファイルを使う場合のパス (指定時は--pdb-idを無視)")
++    parser.add_argument("--work-dir", default=None, help="作業ディレクトリ (省略時は一時ディレクトリを自動生成)")
++    args = parser.parse_args()
++
++    setup_logger()
++
++    work_dir = args.work_dir or tempfile.mkdtemp(
++        prefix=f"gmx_agent_{(args.pdb_file and os.path.splitext(os.path.basename(args.pdb_file))[0]) or args.pdb_id}_"
++    )
++
++    print("🚀 Starting GROMACS Autonomous Agent...")
++    print(f"📁 work_dir: {work_dir}")
++
++    initial_state = build_initial_state(args.pdb_id, args.pdb_file, work_dir)
++
+     # グラフの実行
++    agent_app = build_graph()
+     result = agent_app.invoke(initial_state)
+-    
++
+     print(f"✅ Final Status: {result['status']}")
+     print(f"🔧 Final Config: {result['current_config']}")
++    print(f"📜 History steps recorded: {len(result.get('history', []))}")
++    print(f"📄 Reproduction script: {os.path.join(work_dir, 'reproduce.sh')}")
++
+ 
+ if __name__ == "__main__":
+-    asyncio.run(main())
++    main()
+diff --git a/src/gromacs_agent/nodes/executor.py b/src/gromacs_agent/nodes/executor.py
+index 4c6fd14..8677205 100644
+--- a/src/gromacs_agent/nodes/executor.py
++++ b/src/gromacs_agent/nodes/executor.py
+@@ -18,12 +18,21 @@ def _build_mdp_content(step: str, config: dict) -> str:
+     return ""
+ 
+ 
++# ステージごとに「grompp -c」へ渡すべき直前ステージの出力ファイル
++_COORD_IN = {
++    "em": "neutral.gro",   # genionの出力 (中性化された溶媒和済み構造)
++    "nvt": "em.gro",       # emの出力
++    "npt": "nvt.gro",      # nvtの出力
++    "md": "npt.gro",       # nptの出力
++}
++
++
+ def _run_grompp(stage: str, mdp_file: str, work_dir: str) -> tuple[int, str, str]:
+-    """gromppを実行してTPRファイルを生成"""
++    """gromppを実行してTPRファイルを生成。-cには直前ステージの出力を正しく連鎖させる。"""
+     tools = GromacsTools()
+     args = [
+         "-f", mdp_file,
+-        "-c", "processed.gro",
++        "-c", _COORD_IN.get(stage, "processed.gro"),
+         "-p", "topol.top",
+         "-o", f"{stage}.tpr",
+     ]
+@@ -46,14 +55,55 @@ def execute_node(state: AgentState) -> dict:
+     os.makedirs(work_dir, exist_ok=True)
+     tools = GromacsTools()
+ 
++    pdb_file = state.get("pdb_file", "input.pdb")
++    force_field = config.get("force_field", "amber99sb-ildn")
++    water_model = config.get("water", config.get("water_model", "tip3p"))
++
+     # MCTS対象外の初期ステージ（pdb2gmx, editconf等）は単一コマンド
+     simple_stages = {
+-        "pdb2gmx": ["-f", "input.pdb", "-o", "processed.gro", "-water", "tip3p", "-ff", "amber99sb-ildn"],
++        "pdb2gmx": ["-f", pdb_file, "-o", "processed.gro", "-water", water_model, "-ff", force_field],
+         "editconf": ["-c", "processed.gro", "-o", "box.gro", "-d", "1.0", "-bt", "cubic"],
+         "solvate": ["-cp", "box.gro", "-cs", "spc216.gro", "-o", "solvated.gro", "-p", "topol.top"],
+-        "genion": ["-s", "ions.tpr", "-o", "neutral.gro", "-p", "topol.top", "-pname", "NA", "-nname", "CL", "-neutral"],
+     }
+ 
++    if step == "genion":
++        # genionは事前に ions.tpr (solvate後の構造に対するgrompp出力) が必要。
++        # ions.mdpは空実行用の最小構成でよい (実際のイオン付加パラメータはgenionの引数側で指定する)。
++        try:
++            write_file_and_log(work_dir, "ions.mdp", "integrator = steep\nnsteps = 0\n")
++        except Exception as e:
++            return {
++                "status": "FAILED",
++                "last_error": f"Failed to write ions.mdp: {str(e)}",
++                "log_snippet": "",
++                "work_dir": work_dir,
++            }
++
++        code, stdout, stderr = tools.run_gmx_command(
++            "grompp",
++            ["-f", "ions.mdp", "-c", "solvated.gro", "-p", "topol.top", "-o", "ions.tpr"],
++            cwd=work_dir,
++        )
++        if code != 0:
++            return {
++                "status": "FAILED",
++                "last_error": f"grompp (ions.tpr) failed: {stderr}",
++                "log_snippet": stderr[-1000:],
++                "work_dir": work_dir,
++            }
++
++        code, stdout, stderr = tools.run_gmx_command(
++            "genion",
++            ["-s", "ions.tpr", "-o", "neutral.gro", "-p", "topol.top", "-pname", "NA", "-nname", "CL", "-neutral"],
++            cwd=work_dir,
++        )
++        return {
++            "status": "SUCCESS" if code == 0 else "FAILED",
++            "last_error": stderr if code != 0 else None,
++            "log_snippet": stderr[-1000:] if code != 0 else None,
++            "work_dir": work_dir,
++        }
++
+     if step in simple_stages:
+         code, stdout, stderr = tools.run_gmx_command(step, simple_stages[step], cwd=work_dir)
+         return {
