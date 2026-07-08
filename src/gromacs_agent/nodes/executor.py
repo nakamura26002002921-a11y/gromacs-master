@@ -62,7 +62,7 @@ def execute_node(state: AgentState) -> dict:
     # MCTS対象外の初期ステージ（pdb2gmx, editconf等）は単一コマンド
     simple_stages = {
         "pdb2gmx": ["-f", pdb_file, "-o", "processed.gro", "-water", water_model, "-ff", force_field],
-        "editconf": ["-f", "processed.gro", "-o", "box.gro", "-c", "-d", "1.0", "-bt", "cubic"],
+        "editconf": ["-c", "processed.gro", "-o", "box.gro", "-d", "1.0", "-bt", "cubic"],
         "solvate": ["-cp", "box.gro", "-cs", "spc216.gro", "-o", "solvated.gro", "-p", "topol.top"],
     }
 
@@ -96,6 +96,7 @@ def execute_node(state: AgentState) -> dict:
             "genion",
             ["-s", "ions.tpr", "-o", "neutral.gro", "-p", "topol.top", "-pname", "NA", "-nname", "CL", "-neutral"],
             cwd=work_dir,
+            stdin_input="SOL\n",  # イオンで置換する対象グループとして溶媒(SOL)を選択
         )
         return {
             "status": "SUCCESS" if code == 0 else "FAILED",
