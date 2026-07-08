@@ -5,16 +5,93 @@ from gromacs_agent.core.state import AgentState
 from gromacs_agent.utils.command_logger import write_file_and_log
 
 
+def _effective_config(step: str, config: dict) -> dict:
+    """
+    ステージ単位の上書き設定をマージした「実効config」を返す。
+
+    current_config["stage_overrides"] = {
+        "npt": {"pcoupl": "Berendsen"},
+        "md":  {"pcoupl": "Parrinello-Rahman", "nsteps": 500000},
+    }
+    のように書くと、共通のベース設定 (dt, tcoupl, ref_t等) はそのままに、
+    指定したステージだけ好きなパラメータを上書きできる。
+    nvt→npt(Berendsen)の緩和計算は何も指定しなければ従来通りのデフォルトのまま変わらない。
+    """
+    base = {k: v for k, v in config.items() if k != "stage_overrides"}
+    overrides = (config.get("stage_overrides") or {}).get(step, {})
+    return {**base, **overrides}
+
+
 def _build_mdp_content(step: str, config: dict) -> str:
-    """ステージに応じた最小限のMDPファイル内容を生成"""
+    """
+    ステージに応じたMDPファイル内容を生成する。configはすでに
+    _effective_config() でステージ別上書きがマージされたものを渡すこと。
+
+    configで指定できる主なキー:
+        dt, nsteps, emtol                     : 全ステージ共通の基本パラメータ
+        tcoupl, ref_t, tau_t                  : 温度制御 (nvt/npt/mdで使用)
+        pcoupl, pcoupltype, ref_p, tau_p,
+        compressibility                       : 圧力制御 (npt/mdで使用)
+    """
     dt = config.get("dt", 0.002)
     nsteps = config.get("nsteps", 50000)
     emtol = config.get("emtol", 1000.0)
 
+    tcoupl = config.get("tcoupl", "V-rescale")
+    ref_t = config.get("ref_t", 300)
+    tau_t = config.get("tau_t", 0.1)
+
+    # 圧力制御のデフォルトはBerendsen (npt平衡化での標準的な選択)。
+    # stage_overridesで md だけ Parrinello-Rahman に変える、といった使い方を想定。
+    pcoupl = config.get("pcoupl", "Berendsen")
+    pcoupltype = config.get("pcoupltype", "isotropic")
+    ref_p = config.get("ref_p", 1.0)
+    tau_p = config.get("tau_p", 2.0)
+    compressibility = config.get("compressibility", 4.5e-5)
+
     if step == "em":
-        return f"integrator = steep\nemtol = {emtol}\nnsteps = {nsteps}\n"
-    elif step in ("nvt", "npt", "md"):
-        return f"integrator = md\ndt = {dt}\nnsteps = {nsteps}\n"
+        return (
+            f"integrator = steep\n"
+            f"emtol = {emtol}\n"
+            f"nsteps = {nsteps}\n"
+        )
+
+    if step == "nvt":
+        # nvtでは圧力制御はまだ行わない (体積固定で温度だけ先に平衡化する)
+        return (
+            f"integrator = md\n"
+            f"dt = {dt}\n"
+            f"nsteps = {nsteps}\n"
+            f"tcoupl = {tcoupl}\n"
+            f"tc-grps = System\n"
+            f"ref_t = {ref_t}\n"
+            f"tau_t = {tau_t}\n"
+            f"gen_vel = yes\n"
+            f"gen_temp = {ref_t}\n"
+            f"define = -DPOSRES\n"
+        )
+
+    if step in ("npt", "md"):
+        lines = [
+            "integrator = md",
+            f"dt = {dt}",
+            f"nsteps = {nsteps}",
+            f"tcoupl = {tcoupl}",
+            "tc-grps = System",
+            f"ref_t = {ref_t}",
+            f"tau_t = {tau_t}",
+            f"pcoupl = {pcoupl}",
+            f"pcoupltype = {pcoupltype}",
+            f"ref_p = {ref_p}",
+            f"tau_p = {tau_p}",
+            f"compressibility = {compressibility}",
+        ]
+        if step == "npt":
+            lines.append("define = -DPOSRES")  # nptもまだ拘束を残すのが標準的
+            lines.append("gen_vel = no")        # nvtで得た速度を引き継ぐ
+        # mdでは位置拘束を外し (define指定なし)、nvt/nptで得た速度をそのまま使う
+        return "\n".join(lines) + "\n"
+
     return ""
 
 
@@ -48,7 +125,9 @@ def _run_mdrun(stage: str, work_dir: str) -> tuple[int, str, str]:
 
 def execute_node(state: AgentState) -> dict:
     step = state["current_step"]
-    config = state.get("current_config", {})
+    raw_config = state.get("current_config", {})
+    config = _effective_config(step, raw_config)  # ステージ別上書きをマージ済みのconfig
+
     # work_dirが未指定ならカレントディレクトリにフォールバック
     # (本来は main.py / planner が tempfile.mkdtemp() 等で用意し、state に積んでおく)
     work_dir = state.get("work_dir") or os.getcwd()
