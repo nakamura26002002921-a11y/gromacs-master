@@ -1,8 +1,8 @@
 # src/gromacs_agent/nodes/executor.py
 import os
-import tempfile
 from gromacs_agent.tools.gromacs_tools import GromacsTools
 from gromacs_agent.core.state import AgentState
+from gromacs_agent.utils.command_logger import write_file_and_log
 
 
 def _build_mdp_content(step: str, config: dict) -> str:
@@ -10,7 +10,7 @@ def _build_mdp_content(step: str, config: dict) -> str:
     dt = config.get("dt", 0.002)
     nsteps = config.get("nsteps", 50000)
     emtol = config.get("emtol", 1000.0)
-    
+
     if step == "em":
         return f"integrator = steep\nemtol = {emtol}\nnsteps = {nsteps}\n"
     elif step in ("nvt", "npt", "md"):
@@ -18,28 +18,32 @@ def _build_mdp_content(step: str, config: dict) -> str:
     return ""
 
 
-def _run_grompp(stage: str, mdp_file: str) -> tuple[int, str, str]:
+def _run_grompp(stage: str, mdp_file: str, work_dir: str) -> tuple[int, str, str]:
     """gromppを実行してTPRファイルを生成"""
     tools = GromacsTools()
     args = [
         "-f", mdp_file,
         "-c", "processed.gro",
         "-p", "topol.top",
-        "-o", f"{stage}.tpr"
+        "-o", f"{stage}.tpr",
     ]
-    return tools.run_gmx_command("grompp", args)
+    return tools.run_gmx_command("grompp", args, cwd=work_dir)
 
 
-def _run_mdrun(stage: str) -> tuple[int, str, str]:
+def _run_mdrun(stage: str, work_dir: str) -> tuple[int, str, str]:
     """mdrunを実行"""
     tools = GromacsTools()
     args = ["-deffnm", stage, "-s", f"{stage}.tpr"]
-    return tools.run_gmx_command("mdrun", args)
+    return tools.run_gmx_command("mdrun", args, cwd=work_dir)
 
 
 def execute_node(state: AgentState) -> dict:
     step = state["current_step"]
     config = state.get("current_config", {})
+    # work_dirが未指定ならカレントディレクトリにフォールバック
+    # (本来は main.py / planner が tempfile.mkdtemp() 等で用意し、state に積んでおく)
+    work_dir = state.get("work_dir") or os.getcwd()
+    os.makedirs(work_dir, exist_ok=True)
     tools = GromacsTools()
 
     # MCTS対象外の初期ステージ（pdb2gmx, editconf等）は単一コマンド
@@ -51,41 +55,45 @@ def execute_node(state: AgentState) -> dict:
     }
 
     if step in simple_stages:
-        code, stdout, stderr = tools.run_gmx_command(step, simple_stages[step])
+        code, stdout, stderr = tools.run_gmx_command(step, simple_stages[step], cwd=work_dir)
         return {
             "status": "SUCCESS" if code == 0 else "FAILED",
             "last_error": stderr if code != 0 else None,
             "log_snippet": stderr[-1000:] if code != 0 else None,
+            "work_dir": work_dir,
         }
 
     # em, nvt, npt, md は grompp → mdrun の2段階
-    # 一時的なMDPファイルを作成
     mdp_content = _build_mdp_content(step, config)
     mdp_file = f"{step}.mdp"
-    
+
     try:
-        with open(mdp_file, "w") as f:
-            f.write(mdp_content)
+        # 実ファイルに書き込むと同時に、reproduce.sh へヒアドキュメントとして記録する。
+        # これにより、この.mdpファイル自体が消えてもreproduce.sh単体で再現できる。
+        write_file_and_log(work_dir, mdp_file, mdp_content)
     except Exception as e:
         return {
             "status": "FAILED",
             "last_error": f"Failed to write MDP file: {str(e)}",
             "log_snippet": "",
+            "work_dir": work_dir,
         }
 
     # 1. grompp
-    code, stdout, stderr = _run_grompp(step, mdp_file)
+    code, stdout, stderr = _run_grompp(step, mdp_file, work_dir)
     if code != 0:
         return {
             "status": "FAILED",
             "last_error": f"grompp failed: {stderr}",
             "log_snippet": stderr[-1000:],
+            "work_dir": work_dir,
         }
 
     # 2. mdrun
-    code, stdout, stderr = _run_mdrun(step)
+    code, stdout, stderr = _run_mdrun(step, work_dir)
     return {
         "status": "SUCCESS" if code == 0 else "FAILED",
         "last_error": stderr if code != 0 else None,
         "log_snippet": stderr[-1000:] if code != 0 else None,
+        "work_dir": work_dir,
     }

@@ -19,3 +19,4 @@ class AgentState(TypedDict, total=False):
     history: List[Dict[str, Any]]
     mcts_stages: List[str]           # ← 追加
     mcts_max_iterations: int         # ← 追加
+    work_dir: str  # 全コマンド実行・reproduce.sh の記録先ディレクトリ
