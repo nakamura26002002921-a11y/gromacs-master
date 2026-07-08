@@ -114,6 +114,13 @@ def main():
         "--stage-override", default=None,
         help='ステージ別の上書き設定をJSONで指定 (例: \'{"md": {"pcoupl": "Parrinello-Rahman"}}\')',
     )
+    parser.add_argument("--box-type", default=None,
+                    help="ボックス形状 (cubic, dodecahedron, octahedron等)")
+    parser.add_argument("--box-distance", type=float, default=None,
+                    help="タンパク質からボックス境界までの距離 [nm] (例: 0.3 = 3Å)")
+    parser.add_argument("--box-size", default=None,
+                    help="ボックスの明示的なサイズ [nm] (例: '1.0 1.0 1.0' = 10Å立方体)")
+
     args = parser.parse_args()
 
     setup_logger()
@@ -140,6 +147,9 @@ def main():
         "pcoupl": args.pcoupl,
         "ref_p": args.ref_p,
         "tau_p": args.tau_p,
+        "box_type": args.box_type,
+        "box_distance": args.box_distance,
+        "box_size": args.box_size,
     }
     initial_state = build_initial_state(args.pdb_id, args.pdb_file, work_dir, md_overrides, stage_overrides)
 
