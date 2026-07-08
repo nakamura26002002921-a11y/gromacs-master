@@ -2,11 +2,8 @@ import os
 import json
 import structlog
 from typing import List, Optional
-
-# LangChain のインポート
 from langchain_openai import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-
+from langchain_core.prompts import ChatPromptTemplate
 from gromacs_agent.tools.gromacs_tools import GromacsTools
 from gromacs_agent.core.state import AgentState
 
