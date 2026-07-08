@@ -50,6 +50,16 @@ def advance_stage_node(state: AgentState) -> dict:
     }
 
 
+def stage_failed_node(state: AgentState) -> dict:
+    """
+    replanner/mctsが予算(max_attempts)を使い切って回復できなかった場合の終端処理。
+    replan_nodeは「再実行キュー」を表すために常にstatus="PENDING"を返すため、
+    それをそのままENDに渡すとFinal Statusが誤って"PENDING"になってしまう。
+    ここで明示的にSTAGE_FAILEDへ上書きしてから終了する。
+    """
+    return {"status": "STAGE_FAILED"}
+
+
 def build_graph():
     workflow = StateGraph(AgentState)
 
@@ -59,6 +69,7 @@ def build_graph():
     workflow.add_node("diagnoser", diagnose_node)
     workflow.add_node("replanner", replan_node)
     workflow.add_node("advance_stage", advance_stage_node)
+    workflow.add_node("stage_failed", stage_failed_node)
 
     workflow.set_entry_point("planner")
 
@@ -77,7 +88,7 @@ def build_graph():
     workflow.add_conditional_edges(
         "mcts_stage",
         _route_after_mcts,
-        {"advance": "advance_stage", "end_fail": END},
+        {"advance": "advance_stage", "end_fail": "stage_failed"},
     )
 
     workflow.add_edge("diagnoser", "replanner")
@@ -85,8 +96,10 @@ def build_graph():
     workflow.add_conditional_edges(
         "replanner",
         _route_after_replanner,
-        {"retry": "executor", "end_fail": END},
+        {"retry": "executor", "end_fail": "stage_failed"},
     )
+
+    workflow.add_edge("stage_failed", END)
 
     workflow.add_conditional_edges(
         "advance_stage",
