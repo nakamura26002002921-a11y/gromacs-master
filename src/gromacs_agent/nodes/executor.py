@@ -128,8 +128,8 @@ def execute_node(state: AgentState) -> dict:
     step = state["current_step"]
     raw_config = state.get("current_config", {})
     
-    # stage_overrides があれば適用
-    config = raw_config.get("stage_overrides", {}).get(step, raw_config)
+    # stage_overrides があれば適用 (ベース設定とマージする。上書きが無ければベースのまま)
+    config = _effective_config(step, raw_config)
 
     work_dir = state.get("work_dir") or os.getcwd()
     os.makedirs(work_dir, exist_ok=True)
