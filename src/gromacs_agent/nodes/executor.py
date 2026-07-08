@@ -191,44 +191,38 @@ def execute_node(state: AgentState) -> dict:
             "work_dir": work_dir,
         }
 
-    if step in simple_stages:
-        code, stdout, stderr = tools.run_gmx_command(step, simple_stages[step], cwd=work_dir)
-        return {
-            "status": "SUCCESS" if code == 0 else "FAILED",
-            "last_error": stderr if code != 0 else None,
-            "log_snippet": stderr[-1000:] if code != 0 else None,
-            "work_dir": work_dir,
+    if step in simple_stages or step in ["em", "nvt", "npt", "md"]:
+        args = get_args_for_stage(step, config) # ステージに応じた引数生成
+        
+        # 1. 初回実行
+        code, stdout, stderr = tools.run_gmx_command(get_gmx_cmd(step), args, cwd=work_dir)
+        
+        if code == 0:
+            return {"status": "SUCCESS", ...}
+            
+        # 2. エラー発生 -> MCTSによる自動修復
+        logger.warning(f"Stage {step} failed. Initiating MCTS repair...")
+        
+        initial_state = {
+            "step": step,
+            "args": args,
+            "stderr": stderr,
+            "work_dir": work_dir
         }
-
-    # em, nvt, npt, md は grompp → mdrun の2段階
-    mdp_content = _build_mdp_content(step, config)
-    mdp_file = f"{step}.mdp"
-
-    try:
-        write_file_and_log(work_dir, mdp_file, mdp_content)
-    except Exception as e:
-        return {
-            "status": "FAILED",
-            "last_error": f"Failed to write MDP file: {str(e)}",
-            "log_snippet": "",
-            "work_dir": work_dir,
-        }
-
-    # 1. grompp
-    code, stdout, stderr = _run_grompp(step, mdp_file, work_dir)
-    if code != 0:
-        return {
-            "status": "FAILED",
-            "last_error": f"grompp failed: {stderr}",
-            "log_snippet": stderr[-1000:],
-            "work_dir": work_dir,
-        }
-
-    # 2. mdrun
-    code, stdout, stderr = _run_mdrun(step, work_dir)
-    return {
-        "status": "SUCCESS" if code == 0 else "FAILED",
-        "last_error": stderr if code != 0 else None,
-        "log_snippet": stderr[-1000:] if code != 0 else None,
-        "work_dir": work_dir,
-    }
+        
+        mcts = MCTS(tools=tools, kb=kb, max_iterations=3) # 計算コスト考慮で3回程度
+        best_fix = mcts.search(initial_state)
+        
+        if best_fix:
+            logger.info(f"MCTS found a fix: {best_fix['reason']}")
+            fixed_args = best_fix["args"]
+            
+            # 3. 最終的な修正引数で本番実行 (mdrunなど)
+            code, stdout, stderr = tools.run_gmx_command(get_gmx_cmd(step), fixed_args, cwd=work_dir)
+            
+            if code == 0:
+                # 4. 成功したらKBに保存
+                kb.add_success(step, stderr, args, fixed_args, best_fix["reason"])
+                return {"status": "SUCCESS", ...}
+                
+        return {"status": "FAILED", "last_error": stderr, ...}
