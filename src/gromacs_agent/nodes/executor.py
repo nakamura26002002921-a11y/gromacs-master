@@ -2,8 +2,11 @@ import os
 import json
 import structlog
 from typing import List, Optional
+
+# LangChain のインポート (langchain_core を使用)
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
+
 from gromacs_agent.tools.gromacs_tools import GromacsTools
 from gromacs_agent.core.state import AgentState
 
@@ -17,12 +20,10 @@ def get_llm_fix(step: str, current_args: List[str], stderr: str) -> Optional[Lis
     エラーメッセージをLLMに渡して解析させ、修正後の引数リストを生成する。
     """
     try:
-        # APIキーが設定されていない場合はスキップ
         if not os.environ.get("OPENAI_API_KEY"):
             logger.warning("OPENAI_API_KEY not set. Skipping LLM fix.")
             return None
 
-        # gpt-4o-mini はコストが安く、構造化データの出力に優れている
         llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
         
         prompt = ChatPromptTemplate.from_template(
@@ -56,7 +57,6 @@ If unfixable, return:
         )
         
         chain = prompt | llm
-        # エラーメッセージが長すぎる場合は末尾のみ渡す
         error_snippet = stderr[-1500:] if len(stderr) > 1500 else stderr
         
         response = chain.invoke({
@@ -66,7 +66,6 @@ If unfixable, return:
         })
         
         content = response.content.strip()
-        # LLMがマークダウンコードブロックを出力する場合があるため除去
         if content.startswith("```json"):
             content = content[7:-3]
         elif content.startswith("```"):
@@ -160,4 +159,3 @@ def execute_node(state: AgentState) -> dict:
 
     # 2. MDP生成と grompp/mdrun (em, nvt, npt, md)
     # ... (既存の grompp/mdrun ロジックをここに記述) ...
-    # ※ 必要に応じて、ここにも同様のLLM修復ループを組み込んでください
