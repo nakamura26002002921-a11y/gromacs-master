@@ -63,48 +63,63 @@ def stage_failed_node(state: AgentState) -> dict:
 def build_graph():
     workflow = StateGraph(AgentState)
 
+    # ノード追加
     workflow.add_node("planner", plan_node)
     workflow.add_node("executor", execute_node)
-    workflow.add_node("mcts_stage", mcts_stage_node)
+    workflow.add_node("mcts_stage", mcts_stage_node) # MCTSノードを追加
     workflow.add_node("diagnoser", diagnose_node)
     workflow.add_node("replanner", replan_node)
-    workflow.add_node("advance_stage", advance_stage_node)
-    workflow.add_node("stage_failed", stage_failed_node)
 
     workflow.set_entry_point("planner")
+    workflow.add_edge("planner", "executor")
 
-    workflow.add_conditional_edges(
-        "planner",
-        _route_after_planner,
-        {"mcts": "mcts_stage", "execute": "executor"},
-    )
+    # executor の後のルーティングロジック
+    def route_after_executor(state):
+        if state.get("status") == "FAILED":
+            return "diagnoser" # 失敗すれば Diagnoser (LangChain) へ
+        
+        # MCTS対象ステージ (em, nvtなど) なら MCTS探索へ
+        mcts_stages = state.get("mcts_stages", [])
+        if state["current_step"] in mcts_stages and not state.get("mcts_completed", False):
+            return "mcts_stage"
+            
+        return "end_success"
 
     workflow.add_conditional_edges(
         "executor",
-        _route_after_executor,
-        {"advance": "advance_stage", "diagnose": "diagnoser"},
+        route_after_executor,
+        {
+            "diagnoser": "diagnoser",
+            "mcts_stage": "mcts_stage",
+            "end_success": END
+        }
     )
 
+    # MCTS探索後も、もし失敗すれば Diagnoser へ
     workflow.add_conditional_edges(
         "mcts_stage",
-        _route_after_mcts,
-        {"advance": "advance_stage", "end_fail": "stage_failed"},
+        lambda state: "diagnoser" if state.get("status") == "FAILED" else "end_success",
+        {
+            "diagnoser": "diagnoser",
+            "end_success": END
+        }
     )
 
     workflow.add_edge("diagnoser", "replanner")
 
+    # リトライループ
     workflow.add_conditional_edges(
         "replanner",
-        _route_after_replanner,
-        {"retry": "executor", "end_fail": "stage_failed"},
+        lambda state: "retry" if state.get("attempt_count", 0) < state.get("max_attempts", 3) else "end_fail",
+        {
+            "retry": "executor",
+            "end_fail": END
+        }
     )
 
-    workflow.add_edge("stage_failed", END)
+    return workflow.compile()
 
-    workflow.add_conditional_edges(
-        "advance_stage",
-        lambda s: "done" if s.get("status") == "ALL_DONE" else "next",
-        {"done": END, "next": "planner"},
-    )
+agent_app = build_graph()
+
 
     return workflow.compile()
