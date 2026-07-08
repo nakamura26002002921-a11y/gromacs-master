@@ -122,14 +122,11 @@ def _run_mdrun(stage: str, work_dir: str) -> tuple[int, str, str]:
     args = ["-deffnm", stage, "-s", f"{stage}.tpr"]
     return tools.run_gmx_command("mdrun", args, cwd=work_dir)
 
-
 def execute_node(state: AgentState) -> dict:
     step = state["current_step"]
     raw_config = state.get("current_config", {})
-    config = _effective_config(step, raw_config)  # ステージ別上書きをマージ済みのconfig
+    config = _effective_config(step, raw_config)
 
-    # work_dirが未指定ならカレントディレクトリにフォールバック
-    # (本来は main.py / planner が tempfile.mkdtemp() 等で用意し、state に積んでおく)
     work_dir = state.get("work_dir") or os.getcwd()
     os.makedirs(work_dir, exist_ok=True)
     tools = GromacsTools()
@@ -137,17 +134,27 @@ def execute_node(state: AgentState) -> dict:
     pdb_file = state.get("pdb_file", "input.pdb")
     force_field = config.get("force_field", "amber99sb-ildn")
     water_model = config.get("water", config.get("water_model", "tip3p"))
+    editconf_args = ["-f", "processed.gro", "-o", "box.gro", "-c"]
 
-    # MCTS対象外の初期ステージ（pdb2gmx, editconf等）は単一コマンド
+    box_size = config.get("box_size")
+    box_distance = config.get("box_distance")
+    box_type = config.get("box_type", "cubic")
+
+    if box_size:
+        editconf_args += ["-box"] + box_size.split()
+    else:
+        distance = box_distance if box_distance is not None else 1.0
+        editconf_args += ["-d", str(distance)]
+
+    editconf_args += ["-bt", box_type]
+
     simple_stages = {
         "pdb2gmx": ["-f", pdb_file, "-o", "processed.gro", "-water", water_model, "-ff", force_field],
-        "editconf": ["-f", "processed.gro", "-o", "box.gro", "-c", "-d", "1.0", "-bt", "cubic"],
+        "editconf": editconf_args,
         "solvate": ["-cp", "box.gro", "-cs", "spc216.gro", "-o", "solvated.gro", "-p", "topol.top"],
     }
-
+    
     if step == "genion":
-        # genionは事前に ions.tpr (solvate後の構造に対するgrompp出力) が必要。
-        # ions.mdpは空実行用の最小構成でよい (実際のイオン付加パラメータはgenionの引数側で指定する)。
         try:
             write_file_and_log(work_dir, "ions.mdp", "integrator = steep\nnsteps = 0\n")
         except Exception as e:
@@ -175,7 +182,7 @@ def execute_node(state: AgentState) -> dict:
             "genion",
             ["-s", "ions.tpr", "-o", "neutral.gro", "-p", "topol.top", "-pname", "NA", "-nname", "CL", "-neutral"],
             cwd=work_dir,
-            stdin_input="SOL\n",  # イオンで置換する対象グループとして溶媒(SOL)を選択
+            stdin_input="SOL\n",
         )
         return {
             "status": "SUCCESS" if code == 0 else "FAILED",
@@ -198,8 +205,6 @@ def execute_node(state: AgentState) -> dict:
     mdp_file = f"{step}.mdp"
 
     try:
-        # 実ファイルに書き込むと同時に、reproduce.sh へヒアドキュメントとして記録する。
-        # これにより、この.mdpファイル自体が消えてもreproduce.sh単体で再現できる。
         write_file_and_log(work_dir, mdp_file, mdp_content)
     except Exception as e:
         return {
