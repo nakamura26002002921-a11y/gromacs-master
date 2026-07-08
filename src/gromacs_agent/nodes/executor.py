@@ -3,7 +3,9 @@ import os
 from gromacs_agent.tools.gromacs_tools import GromacsTools
 from gromacs_agent.core.state import AgentState
 from gromacs_agent.utils.command_logger import write_file_and_log
+import structlog
 
+logger = structlog.get_logger()
 
 def _effective_config(step: str, config: dict) -> dict:
     """
@@ -125,7 +127,9 @@ def _run_mdrun(stage: str, work_dir: str) -> tuple[int, str, str]:
 def execute_node(state: AgentState) -> dict:
     step = state["current_step"]
     raw_config = state.get("current_config", {})
-    config = _effective_config(step, raw_config)
+    
+    # stage_overrides があれば適用
+    config = raw_config.get("stage_overrides", {}).get(step, raw_config)
 
     work_dir = state.get("work_dir") or os.getcwd()
     os.makedirs(work_dir, exist_ok=True)
@@ -134,8 +138,9 @@ def execute_node(state: AgentState) -> dict:
     pdb_file = state.get("pdb_file", "input.pdb")
     force_field = config.get("force_field", "amber99sb-ildn")
     water_model = config.get("water", config.get("water_model", "tip3p"))
-    editconf_args = ["-f", "processed.gro", "-o", "box.gro", "-c"]
 
+    # --- editconf の引数を config から動的に構築 ---
+    editconf_args = ["-f", "processed.gro", "-o", "box.gro", "-c"]
     box_size = config.get("box_size")
     box_distance = config.get("box_distance")
     box_type = config.get("box_type", "cubic")
@@ -145,45 +150,19 @@ def execute_node(state: AgentState) -> dict:
     else:
         distance = box_distance if box_distance is not None else 1.0
         editconf_args += ["-d", str(distance)]
-
     editconf_args += ["-bt", box_type]
 
+    # 1. 軽量ステージ (pdb2gmx, editconf, solvate)
     simple_stages = {
-        "pdb2gmx": ["-f", pdb_file, "-o", "processed.gro", "-water", water_model, "-ff", force_field],
+        "pdb2gmx": ["-f", pdb_file, "-o", "processed.gro", "-water", water_model, "-ff", force_field, "-ignh"],
         "editconf": editconf_args,
         "solvate": ["-cp", "box.gro", "-cs", "spc216.gro", "-o", "solvated.gro", "-p", "topol.top"],
     }
-    
-    if step == "genion":
-        try:
-            write_file_and_log(work_dir, "ions.mdp", "integrator = steep\nnsteps = 0\n")
-        except Exception as e:
-            return {
-                "status": "FAILED",
-                "last_error": f"Failed to write ions.mdp: {str(e)}",
-                "log_snippet": "",
-                "work_dir": work_dir,
-            }
 
-        code, stdout, stderr = tools.run_gmx_command(
-            "grompp",
-            ["-f", "ions.mdp", "-c", "solvated.gro", "-p", "topol.top", "-o", "ions.tpr"],
-            cwd=work_dir,
-        )
-        if code != 0:
-            return {
-                "status": "FAILED",
-                "last_error": f"grompp (ions.tpr) failed: {stderr}",
-                "log_snippet": stderr[-1000:],
-                "work_dir": work_dir,
-            }
-
-        code, stdout, stderr = tools.run_gmx_command(
-            "genion",
-            ["-s", "ions.tpr", "-o", "neutral.gro", "-p", "topol.top", "-pname", "NA", "-nname", "CL", "-neutral"],
-            cwd=work_dir,
-            stdin_input="SOL\n",
-        )
+    if step in simple_stages:
+        args = simple_stages[step]
+        code, stdout, stderr = tools.run_gmx_command(step, args, cwd=work_dir)
+        
         return {
             "status": "SUCCESS" if code == 0 else "FAILED",
             "last_error": stderr if code != 0 else None,
@@ -191,52 +170,38 @@ def execute_node(state: AgentState) -> dict:
             "work_dir": work_dir,
         }
 
-    if step in simple_stages or step in ["em", "nvt", "npt", "md"]:
-        args = get_args_for_stage(step, config) # ステージに応じた引数生成
-        
-        # 1. 初回実行
-        code, stdout, stderr = tools.run_gmx_command(get_gmx_cmd(step), args, cwd=work_dir)
-        
-        if code == 0:
-            return {
-                "status": "SUCCESS",
-                "last_error": None,
-                "log_snippet": None,
-                "work_dir": work_dir,
-            }
-            
-        # 2. エラー発生 -> MCTSによる自動修復
-        logger.warning(f"Stage {step} failed. Initiating MCTS repair...")
-        
-        initial_state = {
-            "step": step,
-            "args": args,
-            "stderr": stderr,
-            "work_dir": work_dir
-        }
-        
-        mcts = MCTS(tools=tools, kb=kb, max_iterations=3) # 計算コスト考慮で3回程度
-        best_fix = mcts.search(initial_state)
-        
-        if best_fix:
-            logger.info(f"MCTS found a fix: {best_fix['reason']}")
-            fixed_args = best_fix["args"]
-            
-            # 3. 最終的な修正引数で本番実行 (mdrunなど)
-            code, stdout, stderr = tools.run_gmx_command(get_gmx_cmd(step), fixed_args, cwd=work_dir)
-            
-            if code == 0:
-                # 4. 成功したらKBに保存
-                kb.add_success(step, stderr, args, fixed_args, best_fix["reason"])
-                return {
-                    "status": "SUCCESS",
-                    "last_error": None,
-                    "log_snippet": None,
-                    "work_dir": work_dir,
-                }
-        return {
-            "status": "FAILED",
-            "last_error": None,
-            "log_snippet": None,
-            "work_dir": work_dir,
-        }        
+    # 2. MDP生成と grompp/mdrun (em, nvt, npt, md)
+    mdp_lines = []
+    exclude_keys = {"force_field", "water", "box_type", "box_distance", "box_size", "stage_overrides", "mcts_stages"}
+    for k, v in config.items():
+        if not isinstance(v, dict) and k not in exclude_keys:
+            mdp_lines.append(f"{k} = {v}")
+
+    mdp_file = f"{step}.mdp"
+    with open(os.path.join(work_dir, mdp_file), "w") as f:
+        f.write("\n".join(mdp_lines))
+
+    # 入力groファイルの決定
+    if step == "em":
+        input_gro = "solvated.gro"
+    elif step == "nvt":
+        input_gro = "em.gro"
+    elif step == "npt":
+        input_gro = "nvt.gro"
+    else:
+        input_gro = "npt.gro"
+
+    grompp_args = ["-f", mdp_file, "-c", input_gro, "-p", "topol.top", "-o", f"{step}.tpr", "-maxwarn", "1"]
+    code, out, err = tools.run_gmx_command("grompp", grompp_args, cwd=work_dir)
+    if code != 0:
+        return {"status": "FAILED", "last_error": err, "log_snippet": err[-1000:], "work_dir": work_dir}
+
+    mdrun_args = ["-deffnm", step, "-s", f"{step}.tpr"]
+    code, out, err = tools.run_gmx_command("mdrun", mdrun_args, cwd=work_dir)
+
+    return {
+        "status": "SUCCESS" if code == 0 else "FAILED",
+        "last_error": err if code != 0 else None,
+        "log_snippet": err[-1000:] if code != 0 else None,
+        "work_dir": work_dir
+    }
