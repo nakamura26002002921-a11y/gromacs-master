@@ -18,12 +18,21 @@ def _build_mdp_content(step: str, config: dict) -> str:
     return ""
 
 
+# ステージごとに「grompp -c」へ渡すべき直前ステージの出力ファイル
+_COORD_IN = {
+    "em": "neutral.gro",   # genionの出力 (中性化された溶媒和済み構造)
+    "nvt": "em.gro",       # emの出力
+    "npt": "nvt.gro",      # nvtの出力
+    "md": "npt.gro",       # nptの出力
+}
+
+
 def _run_grompp(stage: str, mdp_file: str, work_dir: str) -> tuple[int, str, str]:
-    """gromppを実行してTPRファイルを生成"""
+    """gromppを実行してTPRファイルを生成。-cには直前ステージの出力を正しく連鎖させる。"""
     tools = GromacsTools()
     args = [
         "-f", mdp_file,
-        "-c", "processed.gro",
+        "-c", _COORD_IN.get(stage, "processed.gro"),
         "-p", "topol.top",
         "-o", f"{stage}.tpr",
     ]
@@ -46,13 +55,54 @@ def execute_node(state: AgentState) -> dict:
     os.makedirs(work_dir, exist_ok=True)
     tools = GromacsTools()
 
+    pdb_file = state.get("pdb_file", "input.pdb")
+    force_field = config.get("force_field", "amber99sb-ildn")
+    water_model = config.get("water", config.get("water_model", "tip3p"))
+
     # MCTS対象外の初期ステージ（pdb2gmx, editconf等）は単一コマンド
     simple_stages = {
-        "pdb2gmx": ["-f", "input.pdb", "-o", "processed.gro", "-water", "tip3p", "-ff", "amber99sb-ildn"],
+        "pdb2gmx": ["-f", pdb_file, "-o", "processed.gro", "-water", water_model, "-ff", force_field],
         "editconf": ["-c", "processed.gro", "-o", "box.gro", "-d", "1.0", "-bt", "cubic"],
         "solvate": ["-cp", "box.gro", "-cs", "spc216.gro", "-o", "solvated.gro", "-p", "topol.top"],
-        "genion": ["-s", "ions.tpr", "-o", "neutral.gro", "-p", "topol.top", "-pname", "NA", "-nname", "CL", "-neutral"],
     }
+
+    if step == "genion":
+        # genionは事前に ions.tpr (solvate後の構造に対するgrompp出力) が必要。
+        # ions.mdpは空実行用の最小構成でよい (実際のイオン付加パラメータはgenionの引数側で指定する)。
+        try:
+            write_file_and_log(work_dir, "ions.mdp", "integrator = steep\nnsteps = 0\n")
+        except Exception as e:
+            return {
+                "status": "FAILED",
+                "last_error": f"Failed to write ions.mdp: {str(e)}",
+                "log_snippet": "",
+                "work_dir": work_dir,
+            }
+
+        code, stdout, stderr = tools.run_gmx_command(
+            "grompp",
+            ["-f", "ions.mdp", "-c", "solvated.gro", "-p", "topol.top", "-o", "ions.tpr"],
+            cwd=work_dir,
+        )
+        if code != 0:
+            return {
+                "status": "FAILED",
+                "last_error": f"grompp (ions.tpr) failed: {stderr}",
+                "log_snippet": stderr[-1000:],
+                "work_dir": work_dir,
+            }
+
+        code, stdout, stderr = tools.run_gmx_command(
+            "genion",
+            ["-s", "ions.tpr", "-o", "neutral.gro", "-p", "topol.top", "-pname", "NA", "-nname", "CL", "-neutral"],
+            cwd=work_dir,
+        )
+        return {
+            "status": "SUCCESS" if code == 0 else "FAILED",
+            "last_error": stderr if code != 0 else None,
+            "log_snippet": stderr[-1000:] if code != 0 else None,
+            "work_dir": work_dir,
+        }
 
     if step in simple_stages:
         code, stdout, stderr = tools.run_gmx_command(step, simple_stages[step], cwd=work_dir)
