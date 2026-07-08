@@ -1,64 +1,66 @@
-# 🧬 GromacsMaster: Autonomous AI Agent for MD Simulations
+# GromacsMaster
 
-**GromacsMaster** は、計算化学研究のための自律型AIエージェントです。
-GROMACSを用いた分子動力学（MD）シミュレーションにおいて、準備から解析までを自律的に実行し、エラー発生時には自ら診断・修正・再試行を行う「人間のような研究者」をサポートします。
+GROMACSによる分子動力学(MD)シミュレーションを自律的に実行・回復するAIエージェント。
 
-本プロジェクトは、AI物理学者エージェント「PhysMaster」の設計思想をGROMACSのドメインに最適化して実装しています。
+**Plan → Execute → Diagnose → Replan** のループをLangGraphの状態遷移グラフで実装し、
+`em`/`nvt`のような「切りの良い単位」ではモンテカルロ木探索(MCTS)で複数のパラメータ候補を
+並行的に検討しながら、失敗しても自律的にパラメータを調整して実行し続けます。
 
----
-
-## 🚀 概要 (Overview)
-
-MDシミュレーションは、系設定、エネルギー最小化、平衡化、本計算と続く複雑なパイプラインと、LINCS警告や座標の吹き飛び（Blowing up）といった多様なエラーに直面します。
-GromacsMasterは、単なるラッパースクリプトではありません。
-
-*   **Plan**: 系から必要なワークフローを計画
-*   **Execute**: GROMACSコマンドを安全に実行
-*   **Observe**: ログとエネルギーを監視
-*   **Diagnose**: エラーの原因をRAGとLLMで推定
-*   **Replan**: パラメータ（dt, 制約条件など）を修正
-*   **Reflect**: 経験をKnowledge Baseに蓄積
-
-このサイクルを自律的に回すことで、研究者のトライ＆エラーの負荷を大幅に低減します。
+arXiv:[2512.19799](https://arxiv.org/abs/2512.19799) (PhysMaster) のアーキテクチャ思想
+(自律的な推論と計算の統合、検証済み手法の知識蓄積) を、GROMACSによるMDシミュレーションという
+ドメインに落とし込んだ実装です。
 
 ---
 
-## ✨ 主な特徴 (Key Features)
+## 🌟 特徴
 
-### 1. LangGraphによる堅牢なワークフロー管理
-単純なReActループではなく、状態遷移グラフ（LangGraph）を採用。
-「成功→次ステップ」「失敗→診断→修正→再試行」という分岐をコードレベルで保証しつつ、柔軟なエラーハンドリングを実現します。
-
-### 2. 計算化学ドメイン特化RAG
-SQLite + FTS5を用いた軽量かつ高速なRAG（Retrieval-Augmented Generation）を実装。
-過去のエラーログと解決策を蓄積し、未知のエラー遭遇時にも類似ケースからヒントを得て推論します。
-
-### 3. 自律的パラメータチューニング
-エラー内容（例: `LINCS WARNING`）に基づき、LLMが自律的に以下のような修正を提案・実行します。
-*   `dt` (タイムステップ) の縮小
-*   `emtol` (EM収束閾値) の厳格化
-*   Position Restraintの追加
-*   水モデルの変更提案
-
-### 4. 完全なログとトレーサビリティ
-すべてのLLM推論、実行コマンド、修正履歴をJSON形式で記録。
-「なぜこのパラメータに変更したのか」の根拠を後から追跡可能です。
-
-### 5. EM/NVT単位のモンテカルロ木探索 (MCTS)
+### 1. em/nvt単位のモンテカルロ木探索 (MCTS)
 GROMACSの1回の実行は数分〜数時間かかるため、単純な「1つの修正を試して失敗したら次」という
-逐次リトライでは非効率です。GromacsMasterは `em` や `nvt` のような**「切りの良い単位」**でMCTSを
-導入し、複数のパラメータ候補を木構造で管理しながら、UCB1アルゴリズムで有望な候補から優先的に
-実行します。
+逐次リトライは非効率です。`em`・`nvt`のような**「切りの良い単位」**でMCTSを導入し、複数の
+パラメータ候補を木構造で管理しながら、UCB1アルゴリズムで有望な候補から優先的に実行します。
 
-*   **ノード** = あるステージにおける1つのパラメータ候補
-*   **選択(Selection)** = KnowledgeBaseのsuccess_rateを事前分布(prior)としたUCB1
-*   **プレイアウト** = 実際のgrompp/mdrun実行 (コストが高いため、ここが唯一の「本物の試行」)
-*   **打ち切り条件** = いずれかの候補が成功した時点でそのステージは完了とみなし、次のステージへ
+- **ノード** = あるステージにおける1つのパラメータ候補
+- **選択(Selection)** = KnowledgeBaseの過去の成功率を事前分布(prior)としたUCB1
+- **プレイアウト** = 実際のgrompp/mdrun実行 (コストが高いため、これが唯一の「本物の試行」)
+- **打ち切り条件** = いずれかの候補が成功した時点でそのステージは完了とみなし、次のステージへ
 
-これにより、探索コスト(実行回数)を抑えつつ、単一の仮説に固執しない頑健な自動修正が可能になります。
-MCTS対象ステージは `configs/default_config.yaml` の `mcts.stages` で変更できます
-(デフォルト: `["em", "nvt"]`)。MCTS対象外のステージ (`pdb2gmx`, `editconf` など) は、
-従来通りシンプルな単発実行 + Diagnoser/Replannerの1本道リトライで処理されます。
+MCTS対象ステージは `mcts_stages` (デフォルト: `["em", "nvt"]`) で変更できます。対象外の
+ステージ (`pdb2gmx`, `editconf`, `solvate`, `genion`, `npt`, `md`) は、単発実行 +
+Diagnoser/Replannerによる1本道リトライ (`max_attempts`回) で処理されます。
+
+### 2. ハイブリッド型ナレッジベース (SQLite + FTS5)
+計算化学でよく知られたエラーパターン (LINCS WARNINGやエネルギー発散など) をあらかじめ
+シードしつつ、実行のたびに成功/失敗を `success_count` / `fail_count` として記録し、
+MCTSのUCB1における事前分布として活用します。実行すればするほど、その環境・その系に
+特化した修正候補が優先されるようになります。
+
+### 3. 完全な再現性 (reproduce.sh)
+実行した全てのgmxコマンドと、動的に生成した`.mdp`ファイルの中身を、work_dir内の
+`reproduce.sh` 1本に記録します。**中間ファイルが全て消えても、このスクリプトと最初の
+入力PDBファイルさえあれば、エージェントを介さずシェルだけで全く同じ手順を再現できます。**
+対話的な入力が必要なコマンド (`genion`等) は `echo 'SOL' | gmx genion ...` の形で
+記録されるため、入力内容ごと再現可能です。
+
+### 4. ステージ別の自由なパラメータ上書き
+`current_config["stage_overrides"]` に辞書を書くことで、ステージごとに好きなパラメータを
+上書きできます。例えば「`nvt`→`npt`(Berendsen)の緩和計算はそのままに、本番run (`md`) だけ
+Parrinello-Rahmanバロスタットに切り替える」といった使い方が可能です。
+
+```python
+current_config = {
+    "dt": 0.002, "nsteps": 50000,
+    "tcoupl": "V-rescale", "ref_t": 300,
+    "pcoupl": "Berendsen",  # 全ステージ共通のデフォルト (npt平衡化はこのまま)
+    "stage_overrides": {
+        "md": {"pcoupl": "Parrinello-Rahman", "nsteps": 500000},
+    },
+}
+```
+
+> **注意**: `em`/`nvt`はMCTS探索の対象です。この2ステージに`stage_overrides`で
+> `dt`等を固定指定すると、MCTSが選んだ値より`stage_overrides`が優先されてしまい、
+> 探索結果を意図せず上書きしてしまいます。`em`/`nvt`には使わず、`npt`/`md`側で
+> 使うことを推奨します。
 
 ---
 
@@ -66,95 +68,118 @@ MCTS対象ステージは `configs/default_config.yaml` の `mcts.stages` で変
 
 ```mermaid
 graph TD
-    User[User Request] --> Planner
-    Planner --> Router{Stage Type?}
-    Router -->|em / nvt 等| MCTS[MCTS Stage Search]
-    Router -->|その他| Executor
-    Executor -->|Success| Advance
-    Executor -->|Failure| Diagnoser
-    Diagnoser -->|RAG + LLM/KB| Replanner
-    Replanner -->|Modify Config| Executor
-    Replanner -->|Max Attempts| StageFailed[Fail]
-    MCTS -->|いずれかの候補が成功| Advance
-    MCTS -->|Budget枯渇| StageFailed
-    Advance -->|次のステージあり| Router
-    Advance -->|全ステージ完了| Done[ALL_DONE]
+    User[main.py] --> Planner
+    Planner -->|em/nvt等 MCTS対象| MCTS[mcts_stage]
+    Planner -->|それ以外| Executor[executor]
 
-    subgraph "Knowledge Base"
-        DB[(SQLite + FTS5, success/fail count)]
+    Executor -->|SUCCESS| Advance[advance_stage]
+    Executor -->|FAILED| Diagnoser[diagnoser]
+    Diagnoser -->|RAG + LLM/KB| Replanner[replanner]
+    Replanner -->|attempt_count < max_attempts| Executor
+    Replanner -->|上限到達| StageFailed[stage_failed]
+
+    MCTS -->|いずれかの候補が成功| Advance
+    MCTS -->|budget枯渇| StageFailed
+
+    Advance -->|次のステージあり| Planner
+    Advance -->|全ステージ完了| Done[ALL_DONE]
+    StageFailed --> End[STAGE_FAILED]
+
+    subgraph "Knowledge Base (SQLite + FTS5)"
+        DB[(success_count / fail_count)]
     end
     Diagnoser -.->|Search| DB
     MCTS -.->|Search / Record Result| DB
 ```
 
+ワークフローは `pdb2gmx → editconf → solvate → genion → em → nvt → npt → md` の
+8ステージ固定です (`nodes/planner.py`)。
+
 ---
 
-## 🛠️ インストール
-
-### 前提条件
-*   Python 3.12+
-*   GROMACS (環境変数 `PATH` に `gmx` が通っていること)
-*   OpenAI API Key または Anthropic API Key
-
-### セットアップ
-
-リポジトリのクローンと依存パッケージのインストール（`uv` 推奨）:
+## 📦 インストール
 
 ```bash
 git clone https://github.com/nakamura26002002921-a11y/gromacs-master.git
 cd gromacs-master
-
-# uvを使った環境構築
-uv venv
-source .venv/bin/activate
-uv pip install -e .
+pip install -e .
 ```
 
-### 環境変数の設定
+**必須の外部依存: GROMACS本体 (`gmx`コマンド)**
+このエージェントはPython側で全ての計算を行うわけではなく、実際に`gmx`コマンドを
+subprocessで呼び出します。事前にGROMACSをインストールし、`gmx`にPATHが通っている
+環境で実行してください。
 
-`.env` ファイルを作成し、APIキーを設定してください。
-
-```env
-OPENAI_API_KEY=sk-...
-# または
-ANTHROPIC_API_KEY=sk-ant-...
+```bash
+gmx --version   # 実行できることを確認
 ```
+
+LLMによる診断 (`diagnoser.py`) を使う場合は `OPENAI_API_KEY` または
+`ANTHROPIC_API_KEY` を環境変数に設定してください。**未設定でも動作します**
+(KnowledgeBaseの検索結果のみでフォールバック診断します)。
 
 ---
 
-## 📖 使い方 (Usage)
+## 🚀 使い方
 
-### 1. 設定ファイルの準備
-`configs/default_config.yaml` を編集し、シミュレーション条件を設定します。
-
-```yaml
-agent:
-  max_attempts: 3
-  llm_provider: "openai"   # openai or anthropic (未設定ならKnowledgeBaseのみで診断)
-  model_name: "gpt-4o"
-
-mcts:
-  stages: ["em", "nvt"]        # MCTSで探索するステージ
-  max_iterations: 4            # 1ステージあたりの最大実行回数
-  max_candidates: 3            # 1回の展開で生成する候補数
-  exploration_constant: 1.41   # UCB1の探索定数 (sqrt(2))
-  max_depth: 3                 # 連鎖的な修正探索の最大深さ
-
-gromacs:
-  force_field: "amber99sb-ildn"
-  water_model: "tip3p"
-```
-
-### 2. 実行
-対象のPDBファイルを配置し、エージェントを起動します。
-
+### 基本
 ```bash
-python main.py
+python main.py                     # デフォルト (1ALC) をRCSBからダウンロードして実行
+python main.py --pdb-id 1AKI       # 別のPDB IDを指定
+python main.py --pdb-file my.pdb   # ローカルのPDBファイルを使う (ダウンロードしない)
+python main.py --work-dir ./run1   # 作業ディレクトリを固定 (省略時は一時ディレクトリ)
 ```
 
-### 3. 結果の確認
-実行ごとの探索木・修正履歴は `AgentState.history` にJSON形式で蓄積され、
-標準出力にも最終ステータスとConfigが表示されます。
+### 力場・水モデル
+```bash
+python main.py --force-field charmm36-jul2022 --water tip4p
+```
+`-ff`に渡す文字列は、手元のGROMACS環境にインストール済みの力場ディレクトリ名と
+一致している必要があります。利用可能な力場は次のコマンドで確認できます。
+```bash
+echo | gmx pdb2gmx -f any.pdb -o /dev/null
+```
+
+### 温度・圧力制御
+```bash
+# 全ステージ共通のデフォルトを変更
+python main.py --tcoupl Nose-Hoover --ref-t 310 --pcoupl Parrinello-Rahman --ref-p 1.0 --tau-p 2.0
+
+# ステージ別に自由に上書き (nvt→npt(Berendsen)はそのまま、mdだけ変更)
+python main.py --stage-override '{"md": {"pcoupl": "Parrinello-Rahman", "nsteps": 500000}}'
+```
+
+### 実行結果の確認
+```
+✅ Final Status: ALL_DONE | STAGE_FAILED
+🔧 Final Config: {...}
+📜 History steps recorded: N          # MCTSステージの探索履歴の件数
+📄 Reproduction script: <work_dir>/reproduce.sh
+```
+
+`STAGE_FAILED`の場合は`work_dir`内の`.log`/`reproduce.sh`と、返された`last_error`を
+確認してください。
+
+---
+
+## ⚙️ `current_config` 一覧
+
+| キー | 既定値 | 用途 |
+|---|---|---|
+| `force_field` | `amber99sb-ildn` | `pdb2gmx -ff` |
+| `water` | `tip3p` | `pdb2gmx -water` |
+| `dt` | `0.002` | 積分タイムステップ [ps] |
+| `nsteps` | `50000` | 各ステージのステップ数 |
+| `emtol` | `1000.0` | `em`の収束判定 [kJ/mol/nm] |
+| `tcoupl` | `V-rescale` | 温度制御アルゴリズム (nvt/npt/md) |
+| `ref_t` | `300` | 目標温度 [K] |
+| `tau_t` | `0.1` | 温度の緩和時定数 [ps] |
+| `pcoupl` | `Berendsen` | 気圧制御アルゴリズム (npt/md) |
+| `pcoupltype` | `isotropic` | 圧力制御のタイプ |
+| `ref_p` | `1.0` | 目標圧力 [bar] |
+| `tau_p` | `2.0` | 圧力の緩和時定数 [ps] |
+| `compressibility` | `4.5e-5` | 等温圧縮率 [bar⁻¹] |
+| `stage_overrides` | `{}` | ステージ別の上書き設定 (上記いずれのキーも指定可) |
 
 ---
 
@@ -162,50 +187,51 @@ python main.py
 
 ```text
 gromacs-master/
-├── configs/
-│   └── default_config.yaml   # agent / mcts / gromacs設定
+├── main.py                        # エントリポイント (CLI引数・PDBダウンロード)
+├── configs/default_config.yaml    # (現状未使用のプレースホルダー)
 ├── src/gromacs_agent/
-│   ├── core/                 # State, Graph定義 (LangGraph), Pydantic Config
-│   ├── nodes/                # planner / executor / diagnoser / replanner / mcts_stage
-│   ├── mcts/                 # MCTSNode, MCTSStageSearch, 候補生成ロジック
-│   ├── knowledge/            # SQLite + FTS5 ナレッジベース (success/fail count付き)
-│   ├── tools/                # GROMACSコマンド実行ラッパー
-│   └── utils/                # ロガー設定 等
-├── tests/                    # pytestテスト (agent全体 / MCTSエンジン単体)
-└── main.py                   # エントリポイント
+│   ├── core/
+│   │   ├── graph.py                # LangGraphの状態遷移定義 (本体)
+│   │   ├── state.py                # AgentState (TypedDict)
+│   │   └── config.py               # Pydanticモデル (現状mainからは未参照)
+│   ├── nodes/
+│   │   ├── planner.py              # ワークフロー計画・work_dir初期化
+│   │   ├── executor.py             # gmxコマンド実行 (MCTS対象外ステージ)
+│   │   ├── mcts_stage.py           # em/nvtのMCTS探索ノード
+│   │   ├── diagnoser.py            # エラー診断 (LLM or KBフォールバック)
+│   │   └── replanner.py            # 診断結果をconfigへ反映し再試行キューへ
+│   ├── mcts/
+│   │   ├── node.py                 # MCTSNode (UCB1, backpropagation)
+│   │   ├── search.py               # MCTSStageSearch (探索エンジン本体)
+│   │   └── candidates.py           # KB/ヒューリスティックによる候補生成
+│   ├── knowledge/db.py             # SQLite + FTS5 ナレッジベース
+│   ├── tools/gromacs_tools.py      # gmxコマンド実行ラッパー (stdin/reproduce.sh対応)
+│   └── utils/
+│       ├── command_logger.py       # reproduce.sh書き出し
+│       └── logger.py               # structlog設定
+└── tests/                          # pytest (test_agent.py / test_mcts.py / test_diagnoser.py)
 ```
 
 ---
 
-## 🧪 開発・テスト
-
-GROMACSがインストールされていない環境でもテストが実行できるよう、`subprocess` をモックしたテストを用意しています。
+## 🧪 テスト
 
 ```bash
-# テストの実行
-pytest tests/
-
-# カバレッジ計測
-pytest --cov=gromacs_agent tests/
+python -m pytest -q
 ```
 
----
-
-## ⚠️ 免責事項 (Disclaimer)
-
-*   **計算結果の責任**: 本エージェントが生成したパラメータや修正内容によって生じたシミュレーションの失敗、計算資源の消費、科学的結論の誤りについて、開発者は一切の責任を負いかねます。必ず研究者自身で結果を検証してください。
-*   **LLMの限界**: LLMは物理法則を完全に理解しているわけではありません。特に複雑な系や特殊な力場においては、誤った診断を行う可能性があります。
-*   **セキュリティ**: `subprocess` を使用してコマンドを実行するため、信頼できない入力を与えないでください。
+`subprocess.run`をモックしているため、GROMACS本体が無い環境でもエージェントの
+制御フロー (MCTSのルーティング、リトライ、ステージ進行) を検証できます。
 
 ---
 
-## 🤝 コントリビューション
+## 既知の制約
 
-計算化学ドメインの知識追加（Knowledge Baseの拡充）や、新しいGROMACS機能のサポートを歓迎します。
-Pull Requestをお送りください。
-
----
-
-## 📜 ライセンス
-
-MIT License
+- `configs/default_config.yaml` と `core/config.py` のPydanticモデルは、現状
+  `main.py`からは参照されていません (設定は`main.py`内のPythonコードで直接組み立てています)。
+  YAMLベースの設定読み込みに統一したい場合は要拡張です。
+- `pdb2gmx`は、欠損原子や複数チェーンなど構造上の問題があると対話的なプロンプトを出す
+  ことがあります。現状`run_gmx_command`は既定で標準入力をEOF終端するため、その場合は
+  素直に失敗として扱われ、diagnoser/replannerのリトライに回ります (自動修復はしません)。
+- MCTSはステージ単位 (例: `em`全体) を1回のプレイアウトとして扱うため、ステージ内の
+  途中経過 (checkpoint) からの再開はサポートしていません。
