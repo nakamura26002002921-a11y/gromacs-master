@@ -198,7 +198,12 @@ def execute_node(state: AgentState) -> dict:
         code, stdout, stderr = tools.run_gmx_command(get_gmx_cmd(step), args, cwd=work_dir)
         
         if code == 0:
-            return {"status": "SUCCESS", ...}
+            return {
+                "status": "SUCCESS",
+                "last_error": None,
+                "log_snippet": None,
+                "work_dir": work_dir,
+            }
             
         # 2. エラー発生 -> MCTSによる自動修復
         logger.warning(f"Stage {step} failed. Initiating MCTS repair...")
@@ -223,6 +228,15 @@ def execute_node(state: AgentState) -> dict:
             if code == 0:
                 # 4. 成功したらKBに保存
                 kb.add_success(step, stderr, args, fixed_args, best_fix["reason"])
-                return {"status": "SUCCESS", ...}
-                
-        return {"status": "FAILED", "last_error": stderr, ...}
+                return {
+                    "status": "SUCCESS",
+                    "last_error": None,
+                    "log_snippet": None,
+                    "work_dir": work_dir,
+                }
+        return {
+            "status": "FAILED",
+            "last_error": None,
+            "log_snippet": None,
+            "work_dir": work_dir,
+        }        
