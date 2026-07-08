@@ -63,26 +63,29 @@ def stage_failed_node(state: AgentState) -> dict:
 def build_graph():
     workflow = StateGraph(AgentState)
 
-    # ノード追加
+    # 1. ノードの追加
     workflow.add_node("planner", plan_node)
     workflow.add_node("executor", execute_node)
-    workflow.add_node("mcts_stage", mcts_stage_node) # MCTSノードを追加
+    workflow.add_node("mcts_stage", mcts_stage_node)
     workflow.add_node("diagnoser", diagnose_node)
     workflow.add_node("replanner", replan_node)
 
+    # 2. エントリーポイントと最初のエッジ
     workflow.set_entry_point("planner")
     workflow.add_edge("planner", "executor")
 
-    # executor の後のルーティングロジック
+    # 3. executor の後のルーティングロジック
     def route_after_executor(state):
+        # 失敗したら Diagnoser (LangChain) へ
         if state.get("status") == "FAILED":
-            return "diagnoser" # 失敗すれば Diagnoser (LangChain) へ
+            return "diagnoser"
         
         # MCTS対象ステージ (em, nvtなど) なら MCTS探索へ
         mcts_stages = state.get("mcts_stages", [])
         if state["current_step"] in mcts_stages and not state.get("mcts_completed", False):
             return "mcts_stage"
             
+        # それ以外（成功かつMCTS不要）なら終了
         return "end_success"
 
     workflow.add_conditional_edges(
@@ -95,7 +98,7 @@ def build_graph():
         }
     )
 
-    # MCTS探索後も、もし失敗すれば Diagnoser へ
+    # 4. MCTS探索後のルーティング
     workflow.add_conditional_edges(
         "mcts_stage",
         lambda state: "diagnoser" if state.get("status") == "FAILED" else "end_success",
@@ -105,9 +108,10 @@ def build_graph():
         }
     )
 
+    # 5. Diagnoser から Replanner へ
     workflow.add_edge("diagnoser", "replanner")
 
-    # リトライループ
+    # 6. Replanner の後のルーティング（リトライループ）
     workflow.add_conditional_edges(
         "replanner",
         lambda state: "retry" if state.get("attempt_count", 0) < state.get("max_attempts", 3) else "end_fail",
@@ -119,7 +123,5 @@ def build_graph():
 
     return workflow.compile()
 
+# main.py から参照されるグローバル変数
 agent_app = build_graph()
-
-
-    return workflow.compile()
