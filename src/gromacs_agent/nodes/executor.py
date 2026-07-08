@@ -14,7 +14,7 @@ def _build_mdp_content(step: str, config: dict) -> str:
     if step == "em":
         return f"integrator = steep\nemtol = {emtol}\nnsteps = {nsteps}\n"
     elif step in ("nvt", "npt", "md"):
-        return f"integrator = md\n_dt = {dt}\nnsteps = {nsteps}\n"
+        return f"integrator = md\ndt = {dt}\nnsteps = {nsteps}\n"
     return ""
 
 
