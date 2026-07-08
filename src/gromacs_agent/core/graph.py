@@ -69,42 +69,45 @@ def build_graph():
     workflow.add_node("mcts_stage", mcts_stage_node)
     workflow.add_node("diagnoser", diagnose_node)
     workflow.add_node("replanner", replan_node)
+    workflow.add_node("advance_stage", advance_stage_node)
+    workflow.add_node("stage_failed", stage_failed_node)
 
     # 2. エントリーポイントと最初のエッジ
     workflow.set_entry_point("planner")
-    workflow.add_edge("planner", "executor")
+    workflow.add_conditional_edges(
+        "planner",
+        _route_after_planner,
+        {
+            "mcts": "mcts_stage",
+            "execute": "executor",
+        }
+    )
 
     # 3. executor の後のルーティングロジック
     def route_after_executor(state):
         # 辞書アクセス (.get) を使用
         if state.get("last_error") is not None:
             return "diagnoser"
-        
-        # MCTS対象ステージ (em, nvtなど) なら MCTS探索へ
-        mcts_stages = state.get("mcts_stages", [])
-        if state.get("current_step") in mcts_stages and not state.get("mcts_completed", False):
-            return "mcts_stage"
-            
-        # それ以外（成功かつMCTS不要）なら終了
-        return "end_success"
+
+        # 成功したら次のステージへ進める (advance_stageがworkflow終端かどうかも判定する)
+        return "advance"
 
     workflow.add_conditional_edges(
         "executor",
         route_after_executor,
         {
             "diagnoser": "diagnoser",
-            "mcts_stage": "mcts_stage",
-            "end_success": END
+            "advance": "advance_stage",
         }
     )
 
     # 4. MCTS探索後のルーティング
     workflow.add_conditional_edges(
         "mcts_stage",
-        lambda state: "diagnoser" if state.get("last_error") is not None else "end_success",
+        lambda state: "diagnoser" if state.get("last_error") is not None else "advance",
         {
             "diagnoser": "diagnoser",
-            "end_success": END
+            "advance": "advance_stage",
         }
     )
 
@@ -114,12 +117,26 @@ def build_graph():
     # 6. Replanner の後のルーティング（リトライループ）
     workflow.add_conditional_edges(
         "replanner",
-        lambda state: "retry" if (state.get("attempt_count", 0) < state.get("max_attempts", 3)) and (state.get("last_error") is not None) else "end_fail",
+        lambda state: "retry" if (state.get("attempt_count", 0) < state.get("max_attempts", 3)) else "end_fail",
         {
             "retry": "executor",
-            "end_fail": END
+            "end_fail": "stage_failed"
         }
     )
+
+    # 7. advance_stage の後のルーティング（全ステージ完了 or 次ステージへ）
+    workflow.add_conditional_edges(
+        "advance_stage",
+        lambda state: "done" if state.get("status") == "ALL_DONE" else _route_after_planner(state),
+        {
+            "done": END,
+            "mcts": "mcts_stage",
+            "execute": "executor",
+        }
+    )
+
+    # 8. stage_failed は終端
+    workflow.add_edge("stage_failed", END)
 
     return workflow.compile()
 
