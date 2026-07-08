@@ -160,6 +160,9 @@ def main():
     print(f"🔧 Final Config: {result['current_config']}")
     print(f"📜 History steps recorded: {len(result.get('history', []))}")
     print(f"📄 Reproduction script: {os.path.join(work_dir, 'reproduce.sh')}")
+    if result.get("last_error"):
+        print("❌ Last Error:", file=sys.stderr)
+        print(result["last_error"], file=sys.stderr)
 
 
 if __name__ == "__main__":
