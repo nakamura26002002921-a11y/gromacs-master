@@ -75,14 +75,14 @@ def build_graph():
     workflow.add_edge("planner", "executor")
 
     # 3. executor の後のルーティングロジック
-    def route_after_executor(state):
-        # 失敗したら Diagnoser (LangChain) へ
-        if state.get("status") == "FAILED":
+    def route_after_executor(state: AgentState):
+        # last_error が None でなければ失敗 -> Diagnoser (LangChain) へ
+        if state.last_error is not None:
             return "diagnoser"
         
         # MCTS対象ステージ (em, nvtなど) なら MCTS探索へ
-        mcts_stages = state.get("mcts_stages", [])
-        if state["current_step"] in mcts_stages and not state.get("mcts_completed", False):
+        mcts_stages = getattr(state, 'mcts_stages', [])
+        if state.current_step in mcts_stages and not getattr(state, 'mcts_completed', False):
             return "mcts_stage"
             
         # それ以外（成功かつMCTS不要）なら終了
@@ -101,7 +101,7 @@ def build_graph():
     # 4. MCTS探索後のルーティング
     workflow.add_conditional_edges(
         "mcts_stage",
-        lambda state: "diagnoser" if state.get("status") == "FAILED" else "end_success",
+        lambda state: "diagnoser" if state.last_error is not None else "end_success",
         {
             "diagnoser": "diagnoser",
             "end_success": END
@@ -114,7 +114,7 @@ def build_graph():
     # 6. Replanner の後のルーティング（リトライループ）
     workflow.add_conditional_edges(
         "replanner",
-        lambda state: "retry" if state.get("attempt_count", 0) < state.get("max_attempts", 3) else "end_fail",
+        lambda state: "retry" if (getattr(state, 'attempt_count', 0) < getattr(state, 'max_attempts', 3)) and (state.last_error is not None) else "end_fail",
         {
             "retry": "executor",
             "end_fail": END
